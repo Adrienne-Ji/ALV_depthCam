@@ -375,8 +375,20 @@ def detect_other_tags(img, intr, base_T, base_rvec, corners, ids):
     if 1 in tag_positions and 2 in tag_positions:
         midpoint = compute_midpoint(tag_positions[1], tag_positions[2])
 
-        # 1. Get the rotation of the floor (Tag 0)
+        # 1. Get the rotation of Tag 0
         rmat_world, _ = cv2.Rodrigues(base_rvec)
+
+        # CORRECTION: Tag 0 is now mounted on the YZ-plane (vertical, orthogonal to original).
+        # Pre-multiply rmat_world by the inverse of the extra physical rotation so that the
+        # tag frame is brought back to the original XY-plane convention BEFORE any calculation.
+        # Tag was tipped +90° around its Y axis (from flat to standing) →  undo with -90° around Y.
+        # NOTE: if any output axis appears negated in testing, flip the sign of that column here.
+        R_yz_to_xy = np.array([
+            [ 0,  0, -1],   # tag-X' = -old tag-Z  (was world-depth, now world-right)
+            [ 0,  1,  0],   # tag-Y' = old tag-Y   (unchanged)
+            [ 1,  0,  0],   # tag-Z' = old tag-X   (was world-right, now world-up / out of tag)
+        ], dtype=float)
+        rmat_world = rmat_world @ R_yz_to_xy   # corrected tag frame, expressed in camera coords
 
         # 2. Invert it (Transpose) to get the 'un-rotate' tool
         rmat_inv = rmat_world.T
@@ -386,10 +398,10 @@ def detect_other_tags(img, intr, base_T, base_rvec, corners, ids):
         p_midpoint = midpoint.flatten()
         raw_dist = p_midpoint - tag0_position
 
-        # 4. THE FIX: Apply the rotation to the distance vector
-        # This forces the X, Y, and Z to be parallel to Tag 0
+        # 4. Apply the rotation to the distance vector
+        # Everything below this point is identical to the original XY-plane logic
         aligned_dist = rmat_inv @ raw_dist
-        
+
         # Log the properly aligned coordinates
         coords_mm = aligned_dist * 1000
 
