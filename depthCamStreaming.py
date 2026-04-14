@@ -18,8 +18,24 @@ TAG_SIZE = 0.100          # Tag 0 (reference base) physical size: 10 cm
 TAG_SIZE_TRACKING = 0.03 # Tags 1 & 2 (device) physical size: 2.5 cm
 CSV_NAME = "heart_sim_output.csv"
 TARGET_FPS = 10            # Consistent output frame rate written to CSV (frames/sec)
-ENABLE_PLOT = False       # Set True to re-enable the live 3D matplotlib window
+ENABLE_PLOT = True        # Temporary: verify relative 3D pose of markers and midpoint
 WARMUP_S = 2.0            # Seconds of pre-detection before CSV recording starts (pre-warms colour cache)
+USE_TAG0_YZ_TO_XY_REMAP = False  # True when Tag 0 is physically mounted on the YZ plane
+# Rotate Tag 0 frame back to XY-plane convention when remap is enabled.
+# NOTE: This is the transpose (inverse) of the forward rotation to undo YZ mounting.
+R_YZ_TO_XY = np.array([
+    [0, 0, 1],
+    [0, 1, 0],
+    [-1, 0, 0],
+], dtype=float)
+
+# Correction for camera frame orientation: 90° CCW about Y, 90° CCW about X, then 180° CCW about X
+# Composed matrix result
+R_CAMERA_FLIP = np.array([
+    [1,  0,  0],  # X_plot <- X_actual
+    [0,  0,  1],  # Y_plot <- Z_actual
+    [0, -1,  0],  # Z_plot <- -Y_actual
+], dtype=float)
 # --- MARKER COLOUR CONFIG ---
 # Set 'enabled': True/False here to choose which colours are tracked.
 # HSV thresholds can also be tuned interactively at runtime with the 't' key.
@@ -383,12 +399,8 @@ def detect_other_tags(img, intr, base_T, base_rvec, corners, ids):
         # tag frame is brought back to the original XY-plane convention BEFORE any calculation.
         # Tag was tipped +90° around its Y axis (from flat to standing) →  undo with -90° around Y.
         # NOTE: if any output axis appears negated in testing, flip the sign of that column here.
-        R_yz_to_xy = np.array([
-            [ 0,  0, -1],   # tag-X' = -old tag-Z  (was world-depth, now world-right)
-            [ 0,  1,  0],   # tag-Y' = old tag-Y   (unchanged)
-            [ 1,  0,  0],   # tag-Z' = old tag-X   (was world-right, now world-up / out of tag)
-        ], dtype=float)
-        rmat_world = rmat_world @ R_yz_to_xy   # corrected tag frame, expressed in camera coords
+        if USE_TAG0_YZ_TO_XY_REMAP:
+            rmat_world = rmat_world @ R_YZ_TO_XY   # corrected tag frame, expressed in camera coords
 
         # 2. Invert it (Transpose) to get the 'un-rotate' tool
         rmat_inv = rmat_world.T
@@ -423,6 +435,7 @@ def compute_midpoint(tag1_tvec, tag2_tvec):
     Compute the midpoint between two translation vectors.
     """
     return (tag1_tvec + tag2_tvec) / 2
+
 
 # --- THE MAIN FUNCTION (THE CONDUCTOR) ---
 def main():
@@ -681,6 +694,10 @@ def main():
                 # Tag 0 is visible — always transform relative to it
                 tag0_position = T_base[:3, 3]          # (3,) camera-frame position of tag 0
                 rmat_world, _ = cv2.Rodrigues(rvec_base.flatten())  # ensure (3,) input
+                if USE_TAG0_YZ_TO_XY_REMAP:
+                    rmat_world = rmat_world @ R_YZ_TO_XY
+                # Apply camera frame axis permutation (map ZX plane to XY)
+                rmat_world = rmat_world @ R_CAMERA_FLIP
                 rmat_inv = rmat_world.T
                 
                 if tag_positions is not None and 1 in tag_positions and 2 in tag_positions:
@@ -832,6 +849,7 @@ def main():
         pipeline.stop()
         if ENABLE_PLOT:
             plt.close('all')
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
