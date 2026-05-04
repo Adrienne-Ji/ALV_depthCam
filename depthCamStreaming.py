@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from collections import deque
 
 # --- SETTINGS ---
-TAG_SIZE = 0.100          # Tag 0 (reference base) physical size: 10 cm
+TAG_SIZE = 0.150          # Tag 0 (reference base) physical size: 15 cm
 TAG_SIZE_TRACKING = 0.03 # Tags 1 & 2 (device) physical size: 2.5 cm
 CSV_NAME = "heart_sim_output.csv"
 TARGET_FPS = 10            # Consistent output frame rate written to CSV (frames/sec)

@@ -7,8 +7,10 @@ from PIL import Image, ImageDraw, ImageFont
 dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
 
 # ===== EASY TO MODIFY =====
-TAG_IDS = [1, 2]           # Which tag IDs to generate (0 is reserved as base tag)
-TAG_SIZES_MM = [25, 30]            # Sizes in millimeters (will generate all combinations)
+TAG_IDS = [1, 2]           # Which tag IDs to generate for the tracking sheet
+TAG_IDS_BASE = [0]         # Base/reference tag — printed separately at full size
+TAG_SIZES_MM = [25, 30]    # Sizes in millimeters for tracking tags
+BASE_TAG_SIZE_MM = 150     # Size for tag 0 (15 cm × 15 cm)
 PRINT_DPI = 300                   # Print resolution in DPI
 # ==========================
 
@@ -85,9 +87,37 @@ for tag_id in TAG_IDS:
     tag_size_px = int(TAG_SIZES_MM[0] / 25.4 * PRINT_DPI)
     y_position += tag_size_px + tag_spacing_v_px
 
-# Save A4 page
+# Save A4 sheet for tracking tags (IDs 1 & 2)
 page_filename = "AprilTags_A4_Sheet.pdf"
 page.save(page_filename, 'PDF', dpi=(PRINT_DPI, PRINT_DPI))
 print(f"\nA4 sheet saved as: {page_filename}")
 print(f"Page size: {A4_WIDTH_MM}mm × {A4_HEIGHT_MM}mm ({a4_width_px}×{a4_height_px}px @ {PRINT_DPI} DPI)")
+
+# --- Generate tag 0 (base/reference) centred on its own A4 page ---
+base_tag_px = int(BASE_TAG_SIZE_MM / 25.4 * PRINT_DPI)
+
+base_page = Image.new('RGB', (a4_width_px, a4_height_px), color='white')
+base_draw = ImageDraw.Draw(base_page)
+
+base_tag_img = np.zeros((base_tag_px, base_tag_px), dtype=np.uint8)
+base_tag_img = cv2.aruco.generateImageMarker(dictionary, 0, base_tag_px, base_tag_img, 1)
+base_tag_pil = Image.fromarray(base_tag_img, mode='L')
+
+# Centre on page
+center_x = (a4_width_px - base_tag_px) // 2
+center_y = (a4_height_px - base_tag_px) // 2
+base_page.paste(base_tag_pil, (center_x, center_y))
+
+# Label
+title_text = f"AprilTag ID 0 — {BASE_TAG_SIZE_MM}mm × {BASE_TAG_SIZE_MM}mm  (BASE / REFERENCE)"
+base_draw.text((margin_px, margin_px), title_text, fill='black', font=label_font)
+
+base_filename_png = f"apriltag_36h11_id0_{BASE_TAG_SIZE_MM}mm.png"
+base_filename_pdf = "AprilTag_ID0_Base_100mm.pdf"
+base_tag_pil_full = base_page  # save the full page
+base_page.save(base_filename_pdf, 'PDF', dpi=(PRINT_DPI, PRINT_DPI))
+base_tag_pil_raw = Image.fromarray(base_tag_img, mode='L')
+base_tag_pil_raw.save(base_filename_png)
+print(f"Base tag PDF saved as: {base_filename_pdf}")
+print(f"Base tag PNG saved as: {base_filename_png}")
 print(f"\nAll tags generated successfully!")
