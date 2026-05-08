@@ -8,6 +8,7 @@ import pyrealsense2 as rs
 import numpy as np
 import cv2
 import csv
+import json
 import time
 import datetime
 import matplotlib.pyplot as plt
@@ -18,9 +19,16 @@ TAG_SIZE = 0.150          # Tag 0 (reference base) physical size: 15 cm
 TAG_SIZE_TRACKING = 0.03 # Tags 1 & 2 (device) physical size: 2.5 cm
 CSV_NAME = "heart_sim_output.csv"
 TARGET_FPS = 10            # Consistent output frame rate written to CSV (frames/sec)
-ENABLE_PLOT = True        # Temporary: verify relative 3D pose of markers and midpoint
+ENABLE_PLOT = False       # Temporary: verify relative 3D pose of markers and midpoint
+PLOT_UPDATE_HZ = TARGET_FPS  # Plot redraw target; can be overridden by sync-to-recording mode
+SYNC_DRAW_TO_RECORDING = True  # Keep display/plot updates aligned to CSV write cadence
+ENABLE_PERF_LOG = False   # Print per-stage timing so bottlenecks are visible in terminal
+PERF_LOG_INTERVAL_S = 2.0 # Seconds between profiler summaries
+ARUCO_DETECT_SCALE = 0.5  # Run tag detection on downscaled frame, then scale corners back up
+FAST_ARUCO_MODE = True    # Relax expensive ArUco options to recover real-time performance
 WARMUP_S = 2.0            # Seconds of pre-detection before CSV recording starts (pre-warms colour cache)
 USE_TAG0_YZ_TO_XY_REMAP = False  # True when Tag 0 is physically mounted on the YZ plane
+MARKER_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "marker_hsv_config.json")
 # Rotate Tag 0 frame back to XY-plane convention when remap is enabled.
 # NOTE: This is the transpose (inverse) of the forward rotation to undo YZ mounting.
 R_YZ_TO_XY = np.array([
@@ -45,18 +53,68 @@ MARKERS = {
                 'hsv_high': np.array([165, 155, 175]),
                 'bgr': (128, 0, 128) },
     'Pink'  : { 'enabled': True,
-                'hsv_low':  np.array([168, 100, 140]),   # H 168-180, S≥100, V≥140
-                'hsv_high': np.array([180, 255, 255]),
+                'hsv_low':  np.array([131, 104, 165]),   # H 168-180, S≥100, V≥140
+                'hsv_high': np.array([169, 134, 197]),
                 'bgr': (147, 20, 255) },
     'Green' : { 'enabled': True,
-                'hsv_low':  np.array([ 45, 158,  98]),   # H 58-85, S≥130, V≥30  (dark green)
-                'hsv_high': np.array([ 55, 210, 125]),
+                'hsv_low':  np.array([ 38, 77,  128]),   # H 58-85, S≥130, V≥30  (dark green)
+                'hsv_high': np.array([ 68, 166, 146]),
                 'bgr': (0, 255, 0) },
     'Yellow': { 'enabled': False,
                 'hsv_low':  np.array([ 24, 150, 100]),   # H 24-32, S≥150, V≥100
                 'hsv_high': np.array([ 32, 255, 255]),
                 'bgr': (0, 255, 255) },
 }
+
+
+def load_marker_config():
+    """Load persisted HSV overrides from disk if available."""
+    if not os.path.exists(MARKER_CONFIG_FILE):
+        return
+
+    try:
+        with open(MARKER_CONFIG_FILE, 'r', encoding='utf-8') as f:
+            saved = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+
+    for name, cfg in saved.items():
+        if name not in MARKERS or not isinstance(cfg, dict):
+            continue
+        low = cfg.get('hsv_low')
+        high = cfg.get('hsv_high')
+        if isinstance(low, list) and len(low) == 3:
+            MARKERS[name]['hsv_low'] = np.array(low, dtype=int)
+        if isinstance(high, list) and len(high) == 3:
+            MARKERS[name]['hsv_high'] = np.array(high, dtype=int)
+        if 'enabled' in cfg:
+            MARKERS[name]['enabled'] = bool(cfg['enabled'])
+
+
+def save_marker_config():
+    """Persist current HSV thresholds so tuner saves survive restarts."""
+    saved = {}
+    for name, cfg in MARKERS.items():
+        saved[name] = {
+            'enabled': bool(cfg.get('enabled', True)),
+            'hsv_low': [int(v) for v in cfg['hsv_low']],
+            'hsv_high': [int(v) for v in cfg['hsv_high']],
+        }
+
+    with open(MARKER_CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(saved, f, indent=2)
+
+
+def build_timestamped_csv_path(base_name):
+    """Append a Unix timestamp to the CSV filename so recordings are not overwritten."""
+    root, ext = os.path.splitext(base_name)
+    if not ext:
+        ext = ".csv"
+    stamp = str(int(time.time()))
+    return f"{root}_{stamp}{ext}"
+
+
+load_marker_config()
 
 # Global variable for clicked point
 clicked_point = None
@@ -67,7 +125,18 @@ def mouse_callback(event, x, y, flags, param):
         clicked_point = (x, y)
 
 
-def hsv_tuner(pipeline, intr, initial_low=None, initial_high=None, color_name="Marker"):
+def build_color_mask(hsv_img, hsv_low, hsv_high):
+    """Build the same cleaned HSV mask used by runtime marker detection."""
+    hsv_smooth = cv2.GaussianBlur(hsv_img, (5, 5), 0)
+    mask = cv2.inRange(hsv_smooth, hsv_low, hsv_high)
+
+    kernel_close = np.ones((3, 3), np.uint8)
+    mask = cv2.dilate(mask, kernel_close, iterations=2)
+    mask = cv2.erode(mask, kernel_close, iterations=2)
+    return mask
+
+
+def hsv_tuner(pipeline, align, intr, depth_scale, initial_low=None, initial_high=None, color_name="Marker"):
     """
     Interactive HSV threshold tuner with live camera feed and trackbars.
 
@@ -105,12 +174,15 @@ def hsv_tuner(pipeline, intr, initial_low=None, initial_high=None, color_name="M
 
     while True:
         frames = pipeline.wait_for_frames()
-        color_frame = frames.get_color_frame()
+        aligned_frames = align.process(frames)
+        color_frame = aligned_frames.get_color_frame()
+        depth_frame = aligned_frames.get_depth_frame()
         if not color_frame:
             continue
 
         img = np.asanyarray(color_frame.get_data())
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        depth_image = np.asanyarray(depth_frame.get_data()) if depth_frame else None
 
         # Read current trackbar positions
         h_min = cv2.getTrackbarPos("H min", WIN_CTRL)
@@ -123,14 +195,17 @@ def hsv_tuner(pipeline, intr, initial_low=None, initial_high=None, color_name="M
         cur_low  = np.array([h_min, s_min, v_min])
         cur_high = np.array([h_max, s_max, v_max])
 
-        mask = cv2.inRange(hsv, cur_low, cur_high)
-
-        # Morphological cleanup preview
-        kernel = np.ones((3, 3), np.uint8)
-        mask_clean = cv2.dilate(mask, kernel, iterations=1)
-        mask_clean = cv2.erode(mask_clean, kernel, iterations=1)
+        mask_clean = build_color_mask(hsv, cur_low, cur_high)
 
         filtered = cv2.bitwise_and(img, img, mask=mask_clean)
+        runtime_hits = []
+        if depth_image is not None:
+            runtime_hits = detect_color_markers(
+                img.copy(), hsv, depth_image, depth_scale, intr,
+                cur_low, cur_high, color_name, (0, 255, 0)
+            )
+            for _xyz, (px, py) in runtime_hits:
+                cv2.circle(filtered, (px, py), 10, (255, 255, 255), 2)
 
         # Overlay current HSV values on the control window
         info = np.zeros((300, 600, 3), dtype=np.uint8)
@@ -146,6 +221,9 @@ def hsv_tuner(pipeline, intr, initial_low=None, initial_high=None, color_name="M
         blob_count = sum(1 for lbl in range(1, num_labels) if stats[lbl, cv2.CC_STAT_AREA] >= 20)
         cv2.putText(info, f"Blobs detected: {blob_count}", (10, 170),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(info, f"Runtime accepted: {len(runtime_hits)}", (10, 205),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (0, 220, 0) if runtime_hits else (0, 120, 255), 2)
         cv2.putText(info, "s=SAVE   r=RESET   q=QUIT", (10, 240),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (180, 180, 180), 1)
 
@@ -157,9 +235,6 @@ def hsv_tuner(pipeline, intr, initial_low=None, initial_high=None, color_name="M
         key = cv2.waitKey(1) & 0xFF
         if key == ord('s'):
             result = (cur_low.copy(), cur_high.copy())
-            print(f"[HSV Tuner] Saved — {color_name}")
-            print(f"  Low : {result[0]}")
-            print(f"  High: {result[1]}")
             break
         elif key == ord('r'):
             cv2.setTrackbarPos("H min", WIN_CTRL, int(low[0]))
@@ -169,7 +244,6 @@ def hsv_tuner(pipeline, intr, initial_low=None, initial_high=None, color_name="M
             cv2.setTrackbarPos("V min", WIN_CTRL, int(low[2]))
             cv2.setTrackbarPos("V max", WIN_CTRL, int(high[2]))
         elif key in (ord('q'), 27):  # q or ESC
-            print(f"[HSV Tuner] Cancelled — {color_name}")
             break
 
     cv2.destroyWindow(WIN_ORIG)
@@ -197,15 +271,7 @@ def detect_color_markers(img, hsv_img, depth_image, depth_scale, intr, hsv_low, 
     Returns:
         List of 3D points [x, y, z] in camera frame (metres)
     """
-    # Blur before thresholding to smooth HSV noise at marker edges
-    hsv_smooth = cv2.GaussianBlur(hsv_img, (5, 5), 0)
-    mask = cv2.inRange(hsv_smooth, hsv_low, hsv_high)
-    
-    # Morphological cleanup: small close to fill interior gaps without shifting centroids.
-    # Large kernels (7x7 x2) expand the blob by 14px and skew centroids for small stickers.
-    kernel_close = np.ones((3, 3), np.uint8)
-    mask = cv2.dilate(mask, kernel_close, iterations=2)
-    mask = cv2.erode( mask, kernel_close, iterations=2)
+    mask = build_color_mask(hsv_img, hsv_low, hsv_high)
     
     # Connected components
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
@@ -437,9 +503,33 @@ def compute_midpoint(tag1_tvec, tag2_tvec):
     return (tag1_tvec + tag2_tvec) / 2
 
 
+def detect_markers_scaled(detector, img_bgr, scale=1.0):
+    """
+    Detect ArUco/AprilTags on a downscaled grayscale image for speed,
+    then map detected corners back to original pixel coordinates.
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    if scale is None or scale >= 0.999:
+        corners, ids, rejected = detector.detectMarkers(gray)
+        return corners, ids, rejected
+
+    h, w = gray.shape[:2]
+    small_w = max(64, int(w * scale))
+    small_h = max(36, int(h * scale))
+    small = cv2.resize(gray, (small_w, small_h), interpolation=cv2.INTER_AREA)
+    corners, ids, rejected = detector.detectMarkers(small)
+
+    if corners:
+        inv_scale = 1.0 / scale
+        corners = [c.astype(np.float32) * inv_scale for c in corners]
+
+    return corners, ids, rejected
+
+
 # --- THE MAIN FUNCTION (THE CONDUCTOR) ---
 def main():
     # Setup
+    csv_output_path = build_timestamped_csv_path(CSV_NAME)
     pipeline = rs.pipeline()
     config = rs.config()
     config.enable_stream(rs.stream.color, 1280, 720,  rs.format.bgr8, 30)
@@ -457,10 +547,10 @@ def main():
         return
 
     aruco_params = cv2.aruco.DetectorParameters()
-    # Adaptive threshold: wider window range catches tags under uneven lighting
+    # Adaptive threshold: narrower search window in fast mode to reduce CPU cost
     aruco_params.adaptiveThreshWinSizeMin = 3
-    aruco_params.adaptiveThreshWinSizeMax = 53
-    aruco_params.adaptiveThreshWinSizeStep = 4
+    aruco_params.adaptiveThreshWinSizeMax = 23 if FAST_ARUCO_MODE else 53
+    aruco_params.adaptiveThreshWinSizeStep = 10 if FAST_ARUCO_MODE else 4
     aruco_params.adaptiveThreshConstant = 3      # lowered from 7 — more sensitive when tag border
                                                  # blends into dark background (no white quiet zone)
     # Allow small markers
@@ -476,10 +566,10 @@ def main():
     # Error correction — 36h11 has strong Hamming distance, use max correction
     aruco_params.errorCorrectionRate = 1.0
     # Subpixel corner refinement for accurate pose
-    aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-    aruco_params.cornerRefinementWinSize = 5
-    aruco_params.cornerRefinementMaxIterations = 30
-    aruco_params.cornerRefinementMinAccuracy = 0.1
+    aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE if FAST_ARUCO_MODE else cv2.aruco.CORNER_REFINE_SUBPIX
+    aruco_params.cornerRefinementWinSize = 3 if FAST_ARUCO_MODE else 5
+    aruco_params.cornerRefinementMaxIterations = 10 if FAST_ARUCO_MODE else 30
+    aruco_params.cornerRefinementMinAccuracy = 0.2 if FAST_ARUCO_MODE else 0.1
     detector = cv2.aruco.ArucoDetector(
         cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11),
         aruco_params
@@ -488,12 +578,12 @@ def main():
     # Initialize CSV with mocap-compatible 6-row header
     enabled_markers = [name for name, cfg in MARKERS.items() if cfg.get('enabled', True)]
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
-    with open(CSV_NAME, 'w', newline='') as f:
+    with open(csv_output_path, 'w', newline='') as f:
         w = csv.writer(f)
         # Row 1: file metadata
         w.writerow([
             "Format Version", "1.23",
-            "Take Name", CSV_NAME.replace('.csv', ''),
+            "Take Name", os.path.splitext(os.path.basename(csv_output_path))[0],
             "Take Notes", "",
             "Capture Frame Rate", TARGET_FPS,
             "Export Frame Rate", TARGET_FPS,
@@ -552,9 +642,10 @@ def main():
     try:
         frame_count = 0
         frame_times = deque(maxlen=30)
+        write_times = deque(maxlen=30)
         start_time = time.time()
-        next_write_ts_ms = None
-        write_interval_ms = 1000.0 / TARGET_FPS
+        next_write_due_s = None
+        write_interval_s = 1.0 / TARGET_FPS
         last_plot_time = 0.0          # wall-clock time of last 3D plot update
         last_display_circles = {}     # name -> list of (px, py) — drawn every frame for stable display
         # Persistence cache for colour markers: name -> (points_list, timestamp)
@@ -563,43 +654,78 @@ def main():
         TAG_PERSISTENCE_S = 0.5     # seconds to hold last known tag world position after dropout
         last_good_tags = {}         # tag_id -> (world_pos_m, wall_time)
         marker_data = []  # Storage for detected markers
-        warmup_end_ts_ms = None     # set on first frame; CSV blocked until this time passes
+        warmup_end_wall_s = None    # set on first frame; CSV blocked until this time passes
+
+        perf_stats = {}
+        perf_last_report = time.perf_counter()
+
+        def perf_add(stage_name, dt_s):
+            if not ENABLE_PERF_LOG:
+                return
+            total_s, count = perf_stats.get(stage_name, (0.0, 0))
+            perf_stats[stage_name] = (total_s + dt_s, count + 1)
+
+        def perf_report_if_due():
+            nonlocal perf_last_report
+            if not ENABLE_PERF_LOG:
+                return
+            now_perf = time.perf_counter()
+            if (now_perf - perf_last_report) < PERF_LOG_INTERVAL_S:
+                return
+            perf_last_report = now_perf
+            if not perf_stats:
+                return
+            items = []
+            for name, (total_s, count) in perf_stats.items():
+                avg_ms = (total_s / max(count, 1)) * 1000.0
+                items.append((avg_ms, count, name))
+            items.sort(reverse=True)
+            summary = " | ".join([f"{name}: {avg_ms:.1f}ms ({count}x)" for avg_ms, count, name in items])
+            print(f"[Perf] {summary}")
+            perf_stats.clear()
+
         while True:
+            loop_t0 = time.perf_counter()
+
+            t0 = time.perf_counter()
             frames = pipeline.wait_for_frames()
             color_frame = frames.get_color_frame()
             depth_frame = frames.get_depth_frame()
+            perf_add("wait_for_frames", time.perf_counter() - t0)
             if not color_frame or not depth_frame: continue
 
             # Warmup: run detection for WARMUP_S seconds before starting CSV recording.
             # This pre-warms last_good_color so frame 0 has full marker data.
             # (The old depth-patch check fired on frame 1, making warmup effectively 0 frames.)
-            frame_ts_ms = color_frame.get_timestamp()
-            if warmup_end_ts_ms is None:
-                warmup_end_ts_ms = frame_ts_ms + WARMUP_S * 1000.0
-            in_warmup = frame_ts_ms < warmup_end_ts_ms
+            now_wall_s = time.perf_counter()
+            if warmup_end_wall_s is None:
+                warmup_end_wall_s = now_wall_s + WARMUP_S
+            in_warmup = now_wall_s < warmup_end_wall_s
 
-            if next_write_ts_ms is None and not in_warmup:
-                next_write_ts_ms = frame_ts_ms
+            if next_write_due_s is None and not in_warmup:
+                next_write_due_s = now_wall_s
             slots_due = 0
-            if not in_warmup and frame_ts_ms >= next_write_ts_ms:
-                slots_due = int((frame_ts_ms - next_write_ts_ms) // write_interval_ms) + 1
-                next_write_ts_ms += slots_due * write_interval_ms
+            if not in_warmup and now_wall_s >= next_write_due_s:
+                slots_due = int((now_wall_s - next_write_due_s) // write_interval_s) + 1
+                next_write_due_s += slots_due * write_interval_s
             do_write = slots_due > 0
 
             # Align depth to colour on CSV-write frames AND during warmup (to pre-warm colour cache)
             depth_image = None
             if do_write or in_warmup:
+                t0 = time.perf_counter()
                 aligned_frames = align.process(frames)
                 aligned_depth = aligned_frames.get_depth_frame()
                 if aligned_depth:
                     depth_image = np.asanyarray(aligned_depth.get_data())
+                perf_add("align_depth", time.perf_counter() - t0)
 
             img = np.asanyarray(color_frame.get_data())
             display_img = img.copy()  # overlays drawn here; img stays raw for HSV/detection
 
             # Show warmup countdown on display so user knows recording hasn't started yet
             if in_warmup:
-                remaining = max(0.0, (warmup_end_ts_ms - frame_ts_ms) / 1000.0)
+                remaining = max(0.0, (warmup_end_wall_s - now_wall_s))
                 cv2.putText(display_img, f"Recording starts in {remaining:.1f}s",
                             (display_img.shape[1]//2 - 220, display_img.shape[0]//2),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 80, 255), 3)
@@ -629,18 +755,22 @@ def main():
                 if 1 <= choice <= len(color_keys):
                     selected = color_keys[choice - 1]
                     cfg = MARKERS[selected]
-                    result = hsv_tuner(pipeline, intr,
+                    result = hsv_tuner(pipeline, align, intr, depth_scale,
                                        initial_low=cfg['hsv_low'].copy(),
                                        initial_high=cfg['hsv_high'].copy(),
                                        color_name=selected)
                     if result is not None:
                         cfg['hsv_low'][:], cfg['hsv_high'][:] = result
+                        save_marker_config()
                 continue  # skip rest of loop, restart fresh frame
 
             # 1. Run ArUco detection ONCE for all tags this frame
-            all_corners, all_ids, _ = detector.detectMarkers(img)
+            t0 = time.perf_counter()
+            all_corners, all_ids, _ = detect_markers_scaled(detector, img, ARUCO_DETECT_SCALE)
+            perf_add("aruco_detect", time.perf_counter() - t0)
 
             # 1a. Detect base tag (Tag 0)
+            t0 = time.perf_counter()
             result = detect_base_tag(display_img, intr, all_corners, all_ids)
             T_base = None
             rvec_base = None
@@ -652,12 +782,14 @@ def main():
             tag_positions = None
             if T_base is not None and rvec_base is not None:
                 midpoint_coords, tag_positions = detect_other_tags(display_img, intr, T_base, rvec_base, all_corners, all_ids)
+            perf_add("tag_pose", time.perf_counter() - t0)
 
             # 2. Detect all enabled coloured markers.
             # Runs on do_write frames AND during warmup so last_good_color is pre-populated
             # before the first CSV row is written.
             all_detections = {}  # name -> list of 3D points
             if (do_write or in_warmup) and depth_image is not None:
+                t0 = time.perf_counter()
                 hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)  # compute HSV from raw frame
                 for name, cfg in MARKERS.items():
                     if not cfg.get('enabled', True):
@@ -683,6 +815,7 @@ def main():
                     # Update persistent pixel positions for stable every-frame display
                     if all_detections[name]:
                         last_display_circles[name] = [(px, py) for _xyz, (px, py) in all_detections[name]]
+                perf_add("color_detect", time.perf_counter() - t0)
 
             # 3. Transform all colored markers relative to Tag 0 world frame
             marker_data = []  # Reset markers for this frame
@@ -744,11 +877,12 @@ def main():
 
             # Write CSV rows at TARGET_FPS cadence; if slots were missed, write catch-up rows.
             if do_write:
+                t0 = time.perf_counter()
                 detected_lookup = {}
                 for marker_mm, _bgr, _name in marker_data:
                     if _name not in detected_lookup:
                         detected_lookup[_name] = marker_mm
-                with open(CSV_NAME, 'a', newline='') as f:
+                with open(csv_output_path, 'a', newline='') as f:
                     writer = csv.writer(f)
                     for _ in range(slots_due):
                         nominal_time = frame_count / TARGET_FPS
@@ -769,6 +903,8 @@ def main():
                                 csv_row += ["", "", ""]
                         writer.writerow(csv_row)
                         frame_count += 1
+                    write_times.append(time.time())
+                    perf_add("csv_write", time.perf_counter() - t0)
 
             # Overlay world-frame positions for live verification (matches what goes into CSV)
             dbg_y = 30
@@ -786,18 +922,31 @@ def main():
                     if 0 <= px < display_img.shape[1] and 0 <= py < display_img.shape[0]:
                         cv2.circle(display_img, (px, py), 8, bgr, 2)
 
-            # Calculate and display frame rate
+            # Calculate and display rates (camera loop vs recording cadence)
             frame_times.append(time.time())
+            cam_fps = 0.0
+            rec_hz = 0.0
             if len(frame_times) > 1:
-                fps = len(frame_times) / (frame_times[-1] - frame_times[0])
-                fps_text = f"FPS: {fps:.1f}"
-                h, w = display_img.shape[:2]
-                cv2.putText(display_img, fps_text, (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            cv2.imshow("Real-Time Heart Tracker", display_img)
+                cam_fps = (len(frame_times) - 1) / max(frame_times[-1] - frame_times[0], 1e-6)
+            if len(write_times) > 1:
+                rec_hz = (len(write_times) - 1) / max(write_times[-1] - write_times[0], 1e-6)
 
-            # Update 3D plot every frame (only when ENABLE_PLOT is True)
-            if ENABLE_PLOT:
+            h, w = display_img.shape[:2]
+            cv2.putText(display_img, f"Cam FPS: {cam_fps:.1f}", (20, h - 46),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+            cv2.putText(display_img, f"REC Hz: {rec_hz:.2f} / {TARGET_FPS:.2f}", (20, h - 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
+            
+            if (not SYNC_DRAW_TO_RECORDING) or do_write or in_warmup:
+                t0 = time.perf_counter()
+                cv2.imshow("Real-Time Heart Tracker", display_img)
+                perf_add("display", time.perf_counter() - t0)
+
+            # Update 3D plot at a limited cadence so Matplotlib does not throttle acquisition.
+            plot_tick_due = do_write if SYNC_DRAW_TO_RECORDING else ((time.time() - last_plot_time) >= (1.0 / max(PLOT_UPDATE_HZ, 0.1)))
+            if ENABLE_PLOT and plot_tick_due:
+                t0 = time.perf_counter()
+                last_plot_time = time.time()
                 ax_3d.clear()
                 ax_3d.scatter(0, 0, 0, color='black', s=120, marker='^', label='Tag 0 (Origin)', alpha=1.0)
 
@@ -840,8 +989,12 @@ def main():
                 if tag2_world is not None: tags_detected.append('2')
                 fig.suptitle(f"World Frame Tracking | Markers: {len(marker_data)} "
                              f"| Tags detected: {', '.join(tags_detected) or 'None'}")
-                fig.canvas.draw()
+                fig.canvas.draw_idle()
                 fig.canvas.flush_events()  # keep window responsive (non-blocking)
+                perf_add("matplotlib", time.perf_counter() - t0)
+
+            perf_add("loop_total", time.perf_counter() - loop_t0)
+            perf_report_if_due()
 
             if key == ord('q'): break
 
