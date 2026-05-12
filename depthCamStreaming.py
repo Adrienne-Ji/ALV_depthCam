@@ -368,7 +368,7 @@ def draw_axes_at_point(img, p_camera, cam_mtx, dist_coeffs, rvec_ref, axis_lengt
     cv2.putText(img, "Ym", tuple(img_pts[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
     cv2.putText(img, "Zm", tuple(img_pts[2]), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
 
-def detect_base_tag(img, intr, corners, ids):
+def detect_base_tag(img, intr, corners, ids, depth_image=None, depth_scale=1.0):
     """
     Detect the base AprilTag (id=0) from pre-computed corners/ids,
     draw markers, axes, and labels on img, and return the transformation matrix.
@@ -407,10 +407,30 @@ def detect_base_tag(img, intr, corners, ids):
     T[:3, :3] = rmat
     T[:3, 3] = tvec_flat
 
+    # Replace PnP translation with depth-sensor position for consistency with colour markers
+    if depth_image is not None:
+        center = corners[idx][0].mean(axis=0)
+        cx_t, cy_t = int(center[0]), int(center[1])
+        h_d, w_d = depth_image.shape[:2]
+        dist_d = None
+        for PATCH_RADIUS in (10, 20, 35):
+            y1 = max(0, cy_t - PATCH_RADIUS)
+            y2 = min(h_d, cy_t + PATCH_RADIUS + 1)
+            x1 = max(0, cx_t - PATCH_RADIUS)
+            x2 = min(w_d, cx_t + PATCH_RADIUS + 1)
+            patch_m = depth_image[y1:y2, x1:x2] * depth_scale
+            valid = patch_m[(patch_m > 0.05) & (patch_m <= 3.0)]
+            if len(valid) >= 3:
+                dist_d = float(np.median(valid))
+                break
+        if dist_d is not None:
+            xyz = rs.rs2_deproject_pixel_to_point(intr, [cx_t, cy_t], dist_d)
+            T[:3, 3] = np.array(xyz)
+
     return T, rvec_flat
 
 
-def detect_other_tags(img, intr, base_T, base_rvec, corners, ids):
+def detect_other_tags(img, intr, base_T, base_rvec, corners, ids, depth_image=None, depth_scale=1.0):
     """
     Detect AprilTags 1 and 2 from pre-computed corners/ids, compute their midpoint,
     and place the base coordinate system (from tag 0) at this midpoint.
@@ -443,13 +463,34 @@ def detect_other_tags(img, intr, base_T, base_rvec, corners, ids):
 
     for i, tag_id in enumerate(filtered_ids):
         rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(filtered_corners[i], TAG_SIZE_TRACKING, cam_mtx, dist_coeffs)
-        dist_from_camera = float(np.linalg.norm(tvecs[0]))
 
+        # Get camera-frame position: prefer depth sensor over PnP for consistency with colour markers
+        pos = tvecs[0].flatten().copy()
+        if depth_image is not None:
+            center = filtered_corners[i][0].mean(axis=0)
+            cx_t, cy_t = int(center[0]), int(center[1])
+            h_d, w_d = depth_image.shape[:2]
+            dist_d = None
+            for PATCH_RADIUS in (10, 20, 35):
+                y1 = max(0, cy_t - PATCH_RADIUS)
+                y2 = min(h_d, cy_t + PATCH_RADIUS + 1)
+                x1 = max(0, cx_t - PATCH_RADIUS)
+                x2 = min(w_d, cx_t + PATCH_RADIUS + 1)
+                patch_m = depth_image[y1:y2, x1:x2] * depth_scale
+                valid = patch_m[(patch_m > 0.05) & (patch_m <= 3.0)]
+                if len(valid) >= 3:
+                    dist_d = float(np.median(valid))
+                    break
+            if dist_d is not None:
+                xyz = rs.rs2_deproject_pixel_to_point(intr, [cx_t, cy_t], dist_d)
+                pos = np.array(xyz)
+
+        dist_from_camera = float(np.linalg.norm(pos))
         # Reject implausible poses
         if not (MIN_TAG_DIST <= dist_from_camera <= MAX_TAG_DIST):
             continue
 
-        tag_positions[tag_id] = tvecs[0].flatten().copy()  # flatten to (3,) + copy to avoid numpy view aliasing
+        tag_positions[tag_id] = pos
 
         # Draw bounding box and label for target tags only
         cv2.aruco.drawDetectedMarkers(img, [filtered_corners[i]], np.array([[tag_id]]))
@@ -771,7 +812,7 @@ def main():
 
             # 1a. Detect base tag (Tag 0)
             t0 = time.perf_counter()
-            result = detect_base_tag(display_img, intr, all_corners, all_ids)
+            result = detect_base_tag(display_img, intr, all_corners, all_ids, depth_image, depth_scale)
             T_base = None
             rvec_base = None
             if result is not None:
@@ -781,7 +822,7 @@ def main():
             midpoint_coords = None
             tag_positions = None
             if T_base is not None and rvec_base is not None:
-                midpoint_coords, tag_positions = detect_other_tags(display_img, intr, T_base, rvec_base, all_corners, all_ids)
+                midpoint_coords, tag_positions = detect_other_tags(display_img, intr, T_base, rvec_base, all_corners, all_ids, depth_image, depth_scale)
             perf_add("tag_pose", time.perf_counter() - t0)
 
             # 2. Detect all enabled coloured markers.
