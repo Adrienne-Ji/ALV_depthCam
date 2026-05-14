@@ -28,6 +28,13 @@ ARUCO_DETECT_SCALE = 0.5  # Run tag detection on downscaled frame, then scale co
 FAST_ARUCO_MODE = True    # Relax expensive ArUco options to recover real-time performance
 WARMUP_S = 2.0            # Seconds of pre-detection before CSV recording starts (pre-warms colour cache)
 USE_TAG0_YZ_TO_XY_REMAP = False  # True when Tag 0 is physically mounted on the YZ plane
+CIRCULARITY_MIN = 0.45    # Minimum circularity (4π·area/perimeter²) to accept a blob as a round marker
+MARKER_AREA_MIN = 20      # Minimum contour area in pixels to consider
+MARKER_AREA_MAX = 8000    # Maximum contour area — rejects large glare patches / background blobs
+# Shadow-fallback cascade: when primary HSV detection finds no circular blob, retry with V
+# channel expanded by this many units in each direction.  H and S are kept tight so that the
+# circularity filter remains the only false-positive guard.  Set to 0 to disable.
+SHADOW_V_SLACK = 90
 MARKER_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "marker_hsv_config.json")
 # Rotate Tag 0 frame back to XY-plane convention when remap is enabled.
 # NOTE: This is the transpose (inverse) of the forward rotation to undo YZ mounting.
@@ -125,14 +132,11 @@ def mouse_callback(event, x, y, flags, param):
         clicked_point = (x, y)
 
 
-def build_color_mask(hsv_img, hsv_low, hsv_high):
-    """Build the same cleaned HSV mask used by runtime marker detection."""
-    hsv_smooth = cv2.GaussianBlur(hsv_img, (5, 5), 0)
-    mask = cv2.inRange(hsv_smooth, hsv_low, hsv_high)
-
-    kernel_close = np.ones((3, 3), np.uint8)
-    mask = cv2.dilate(mask, kernel_close, iterations=2)
-    mask = cv2.erode(mask, kernel_close, iterations=2)
+def build_color_mask(hsv_blurred, hsv_low, hsv_high):
+    """Build a cleaned HSV mask from a pre-blurred HSV image."""
+    mask = cv2.inRange(hsv_blurred, hsv_low, hsv_high)
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     return mask
 
 
@@ -182,6 +186,7 @@ def hsv_tuner(pipeline, align, intr, depth_scale, initial_low=None, initial_high
 
         img = np.asanyarray(color_frame.get_data())
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        hsv_blurred = cv2.GaussianBlur(hsv, (5, 5), 0)
         depth_image = np.asanyarray(depth_frame.get_data()) if depth_frame else None
 
         # Read current trackbar positions
@@ -195,16 +200,16 @@ def hsv_tuner(pipeline, align, intr, depth_scale, initial_low=None, initial_high
         cur_low  = np.array([h_min, s_min, v_min])
         cur_high = np.array([h_max, s_max, v_max])
 
-        mask_clean = build_color_mask(hsv, cur_low, cur_high)
+        mask_clean = build_color_mask(hsv_blurred, cur_low, cur_high)
 
         filtered = cv2.bitwise_and(img, img, mask=mask_clean)
         runtime_hits = []
         if depth_image is not None:
             runtime_hits = detect_color_markers(
-                img.copy(), hsv, depth_image, depth_scale, intr,
-                cur_low, cur_high, color_name, (0, 255, 0)
+                hsv_blurred, depth_image, depth_scale, intr,
+                cur_low, cur_high
             )
-            for _xyz, (px, py) in runtime_hits:
+            for _, (px, py) in runtime_hits:
                 cv2.circle(filtered, (px, py), 10, (255, 255, 255), 2)
 
         # Overlay current HSV values on the control window
@@ -216,9 +221,14 @@ def hsv_tuner(pipeline, align, intr, depth_scale, initial_low=None, initial_high
         cv2.putText(info, f"High: H={h_max:3d}  S={s_max:3d}  V={v_max:3d}", (10, 120),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
-        # Count detected blobs
-        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask_clean, connectivity=8)
-        blob_count = sum(1 for lbl in range(1, num_labels) if stats[lbl, cv2.CC_STAT_AREA] >= 20)
+        # Count circular blobs matching the marker criteria
+        cnts, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        blob_count = 0
+        for cnt in cnts:
+            a = cv2.contourArea(cnt)
+            p = cv2.arcLength(cnt, True)
+            if a >= MARKER_AREA_MIN and p > 0 and (4 * np.pi * a / (p * p)) >= CIRCULARITY_MIN:
+                blob_count += 1
         cv2.putText(info, f"Blobs detected: {blob_count}", (10, 170),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         cv2.putText(info, f"Runtime accepted: {len(runtime_hits)}", (10, 205),
@@ -253,40 +263,35 @@ def hsv_tuner(pipeline, align, intr, depth_scale, initial_low=None, initial_high
     return result
 
 
-def detect_color_markers(img, hsv_img, depth_image, depth_scale, intr, hsv_low, hsv_high, color_name, marker_color):
+def _find_circular_blobs(mask, depth_image, depth_scale, intr):
     """
-    Detect markers of a specific color using connected components.
-
-    Args:
-        img: BGR image
-        hsv_img: HSV image
-        depth_image: Raw uint16 depth frame as numpy array (from depth_frame.get_data())
-        depth_scale: Depth scale factor (metres per unit)
-        intr: Camera intrinsics
-        hsv_low: Lower HSV bound (numpy array)
-        hsv_high: Upper HSV bound (numpy array)
-        color_name: Name of color for labeling
-        marker_color: BGR tuple for visualization circle color
-
-    Returns:
-        List of 3D points [x, y, z] in camera frame (metres)
+    From a binary mask find all contours that pass the circularity + area gates and
+    have a valid depth reading.  Returns a list of (xyz, (cx, cy), circularity).
     """
-    mask = build_color_mask(hsv_img, hsv_low, hsv_high)
-    
-    # Connected components
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    marker_points = []
-    
-    for label in range(1, num_labels):
-        area = stats[label, cv2.CC_STAT_AREA]
-        cx, cy = int(centroids[label][0]), int(centroids[label][1])
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+    h_d, w_d = depth_image.shape[:2]
 
-        if area < 20:
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < MARKER_AREA_MIN or area > MARKER_AREA_MAX:
             continue
+
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter < 1.0:
+            continue
+        circularity = 4.0 * np.pi * area / (perimeter * perimeter)
+        if circularity < CIRCULARITY_MIN:
+            continue
+
+        M = cv2.moments(cnt)
+        if M['m00'] == 0:
+            continue
+        cx = int(M['m10'] / M['m00'])
+        cy = int(M['m01'] / M['m00'])
 
         # Sample depth with an expanding patch — handles edge regions where
         # aligned depth has sparse/invalid pixels due to sensor offset.
-        h_d, w_d = depth_image.shape[:2]
         dist = None
         for PATCH_RADIUS in (10, 20, 35):
             y1 = max(0, cy - PATCH_RADIUS)
@@ -295,21 +300,47 @@ def detect_color_markers(img, hsv_img, depth_image, depth_scale, intr, hsv_low, 
             x2 = min(w_d, cx + PATCH_RADIUS + 1)
             patch_m = depth_image[y1:y2, x1:x2] * depth_scale
             valid = patch_m[(patch_m > 0.05) & (patch_m <= 3.0)]
-            if len(valid) >= 3:          # need at least 3 valid pixels for a reliable median
+            if len(valid) >= 3:
                 dist = float(np.median(valid))
                 break
         if dist is None:
             continue
 
-        if dist <= 3.0:
-            xyz = rs.rs2_deproject_pixel_to_point(intr, [cx, cy], dist)
-            marker_points.append((xyz, (cx, cy), area))  # store 3D point + pixel centroid + area
+        xyz = rs.rs2_deproject_pixel_to_point(intr, [cx, cy], dist)
+        candidates.append((xyz, (cx, cy), circularity))
 
-    # Return only the largest blob per call (most likely the real sticker, not a false positive)
-    if marker_points:
-        marker_points.sort(key=lambda p: p[2], reverse=True)  # sort by area descending
-        return [(p[0], p[1]) for p in marker_points[:1]]  # return only best candidate
-    return marker_points
+    return candidates
+
+
+def detect_color_markers(hsv_blurred, depth_image, depth_scale, intr, hsv_low, hsv_high):
+    """
+    Detect markers of a specific color using contour circularity with a shadow fallback.
+
+    Primary pass uses the calibrated HSV range exactly.  If no circular blob is found,
+    a second pass relaxes the V (brightness) channel by SHADOW_V_SLACK in each direction
+    while keeping H and S unchanged.  Hue is the most illumination-stable HSV channel,
+    so keeping it tight limits false positives even with the wider V window.
+
+    Returns:
+        List of (xyz, (cx, cy)) for the best circular candidate, or [] if none found.
+    """
+    # --- Primary pass ---
+    mask = build_color_mask(hsv_blurred, hsv_low, hsv_high)
+    candidates = _find_circular_blobs(mask, depth_image, depth_scale, intr)
+
+    # --- Shadow fallback: relax V only, keep H and S tight ---
+    if not candidates and SHADOW_V_SLACK > 0:
+        shadow_low  = hsv_low.copy()
+        shadow_high = hsv_high.copy()
+        shadow_low[2]  = max(0,   int(hsv_low[2])  - SHADOW_V_SLACK)
+        shadow_high[2] = min(255, int(hsv_high[2]) + SHADOW_V_SLACK)
+        mask = build_color_mask(hsv_blurred, shadow_low, shadow_high)
+        candidates = _find_circular_blobs(mask, depth_image, depth_scale, intr)
+
+    if candidates:
+        candidates.sort(key=lambda p: p[2], reverse=True)
+        return [(p[0], p[1]) for p in candidates[:1]]
+    return []
 
 def get_multi_sticker_centroid(sticker_points):
     """
@@ -696,6 +727,7 @@ def main():
         last_good_tags = {}         # tag_id -> (world_pos_m, wall_time)
         marker_data = []  # Storage for detected markers
         warmup_end_wall_s = None    # set on first frame; CSV blocked until this time passes
+        csv_file = None             # opened once before the loop; closed in finally
 
         perf_stats = {}
         perf_last_report = time.perf_counter()
@@ -725,6 +757,9 @@ def main():
             print(f"[Perf] {summary}")
             perf_stats.clear()
 
+        csv_file = open(csv_output_path, 'a', newline='')
+        csv_writer_obj = csv.writer(csv_file)
+
         while True:
             loop_t0 = time.perf_counter()
 
@@ -751,39 +786,10 @@ def main():
                 next_write_due_s += slots_due * write_interval_s
             do_write = slots_due > 0
 
-            # Align depth to colour on CSV-write frames AND during warmup (to pre-warm colour cache)
-            depth_image = None
-            if do_write or in_warmup:
-                t0 = time.perf_counter()
-                aligned_frames = align.process(frames)
-                aligned_depth = aligned_frames.get_depth_frame()
-                if aligned_depth:
-                    depth_image = np.asanyarray(aligned_depth.get_data())
-                perf_add("align_depth", time.perf_counter() - t0)
-
-            img = np.asanyarray(color_frame.get_data())
-            display_img = img.copy()  # overlays drawn here; img stays raw for HSV/detection
-
-            # Show warmup countdown on display so user knows recording hasn't started yet
-            if in_warmup:
-                remaining = max(0.0, (warmup_end_wall_s - now_wall_s))
-                cv2.putText(display_img, f"Recording starts in {remaining:.1f}s",
-                            (display_img.shape[1]//2 - 220, display_img.shape[0]//2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 80, 255), 3)
-            # depth_image set above (only when do_write=True)
-            # HSV is only needed for colour detection, which is gated on do_write
-            hsv = None
-            
-            # Reset variables for this frame
-            tag0_position = None
-            rmat_inv = None
-
             key = cv2.waitKey(1) & 0xFF
-            # --- Keypress controls ---
-            # t = open HSV tuner menu to select which colour to tune
-            # q = quit
+
+            # Keypress: t = HSV tuner, q = quit
             if key == ord('t'):
-                # Print colour menu to terminal
                 color_keys = list(MARKERS.keys())
                 print("\n[HSV Tuner] Select colour to tune:")
                 for idx, name in enumerate(color_keys):
@@ -803,9 +809,39 @@ def main():
                     if result is not None:
                         cfg['hsv_low'][:], cfg['hsv_high'][:] = result
                         save_marker_config()
-                continue  # skip rest of loop, restart fresh frame
+                continue
 
-            # 1. Run ArUco detection ONCE for all tags this frame
+            # Track every camera frame for the FPS display, then fast-exit if there is
+            # nothing to record or display.  With SYNC_DRAW_TO_RECORDING=True the display
+            # only updates on write frames, so running ArUco on every camera frame (30 fps)
+            # wastes ~20-30 ms per frame on work that is immediately discarded.
+            frame_times.append(time.time())
+            if not do_write and not in_warmup:
+                if key == ord('q'): break
+                perf_add("loop_total", time.perf_counter() - loop_t0)
+                continue
+
+            # Full detection path — only reached on write/warmup frames.
+            t0 = time.perf_counter()
+            aligned_frames = align.process(frames)
+            aligned_depth = aligned_frames.get_depth_frame()
+            depth_image = np.asanyarray(aligned_depth.get_data()) if aligned_depth else None
+            perf_add("align_depth", time.perf_counter() - t0)
+
+            img = np.asanyarray(color_frame.get_data())
+            display_img = img.copy()
+
+            if in_warmup:
+                remaining = max(0.0, (warmup_end_wall_s - now_wall_s))
+                cv2.putText(display_img, f"Recording starts in {remaining:.1f}s",
+                            (display_img.shape[1]//2 - 220, display_img.shape[0]//2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 80, 255), 3)
+
+            hsv = None
+            tag0_position = None
+            rmat_inv = None
+
+            # 1. Run ArUco detection (write/warmup frames only)
             t0 = time.perf_counter()
             all_corners, all_ids, _ = detect_markers_scaled(detector, img, ARUCO_DETECT_SCALE)
             perf_add("aruco_detect", time.perf_counter() - t0)
@@ -818,7 +854,7 @@ def main():
             if result is not None:
                 T_base, rvec_base = result
 
-            # 1b. Detect Tags 1 & 2 using the same detection result
+            # 1b. Detect Tags 1 & 2
             midpoint_coords = None
             tag_positions = None
             if T_base is not None and rvec_base is not None:
@@ -831,13 +867,14 @@ def main():
             all_detections = {}  # name -> list of 3D points
             if (do_write or in_warmup) and depth_image is not None:
                 t0 = time.perf_counter()
-                hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)  # compute HSV from raw frame
+                hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+                hsv_blurred = cv2.GaussianBlur(hsv, (5, 5), 0)  # blurred once, shared across all colours
                 for name, cfg in MARKERS.items():
                     if not cfg.get('enabled', True):
                         continue
                     fresh = detect_color_markers(
-                        display_img, hsv, depth_image, depth_scale, intr,
-                        cfg['hsv_low'], cfg['hsv_high'], name, cfg['bgr'])
+                        hsv_blurred, depth_image, depth_scale, intr,
+                        cfg['hsv_low'], cfg['hsv_high'])
                     if fresh:
                         # Good detection — update cache with camera-frame points AND current transform
                         # (only store transform if Tag 0 is currently visible)
@@ -923,29 +960,27 @@ def main():
                 for marker_mm, _bgr, _name in marker_data:
                     if _name not in detected_lookup:
                         detected_lookup[_name] = marker_mm
-                with open(csv_output_path, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    for _ in range(slots_due):
-                        nominal_time = frame_count / TARGET_FPS
-                        csv_row = [frame_count, f"{nominal_time:.4f}"]
-                        # Tag0 is always world origin (0,0,0) — recorded as reference
-                        tag0_present = T_base is not None
-                        csv_row += ["0.000000", "0.000000", "0.000000"] if tag0_present else ["", "", ""]
-                        for pos_m in [tag1_world, tag2_world, midpoint_world]:
-                            if pos_m is not None:
-                                csv_row += [f"{pos_m[0]:.6f}", f"{pos_m[1]:.6f}", f"{pos_m[2]:.6f}"]
-                            else:
-                                csv_row += ["", "", ""]
-                        for n in enabled_markers:
-                            if n in detected_lookup:
-                                pos_m = detected_lookup[n] / 1000.0
-                                csv_row += [f"{pos_m[0]:.6f}", f"{pos_m[1]:.6f}", f"{pos_m[2]:.6f}"]
-                            else:
-                                csv_row += ["", "", ""]
-                        writer.writerow(csv_row)
-                        frame_count += 1
-                    write_times.append(time.time())
-                    perf_add("csv_write", time.perf_counter() - t0)
+                for _ in range(slots_due):
+                    nominal_time = frame_count / TARGET_FPS
+                    csv_row = [frame_count, f"{nominal_time:.4f}"]
+                    tag0_present = T_base is not None
+                    csv_row += ["0.000000", "0.000000", "0.000000"] if tag0_present else ["", "", ""]
+                    for pos_m in [tag1_world, tag2_world, midpoint_world]:
+                        if pos_m is not None:
+                            csv_row += [f"{pos_m[0]:.6f}", f"{pos_m[1]:.6f}", f"{pos_m[2]:.6f}"]
+                        else:
+                            csv_row += ["", "", ""]
+                    for n in enabled_markers:
+                        if n in detected_lookup:
+                            pos_m = detected_lookup[n] / 1000.0
+                            csv_row += [f"{pos_m[0]:.6f}", f"{pos_m[1]:.6f}", f"{pos_m[2]:.6f}"]
+                        else:
+                            csv_row += ["", "", ""]
+                    csv_writer_obj.writerow(csv_row)
+                    frame_count += 1
+                csv_file.flush()
+                write_times.append(time.time())
+                perf_add("csv_write", time.perf_counter() - t0)
 
             # Overlay world-frame positions for live verification (matches what goes into CSV)
             dbg_y = 30
@@ -964,7 +999,6 @@ def main():
                         cv2.circle(display_img, (px, py), 8, bgr, 2)
 
             # Calculate and display rates (camera loop vs recording cadence)
-            frame_times.append(time.time())
             cam_fps = 0.0
             rec_hz = 0.0
             if len(frame_times) > 1:
@@ -1041,6 +1075,8 @@ def main():
 
     finally:
         pipeline.stop()
+        if csv_file is not None:
+            csv_file.close()
         if ENABLE_PLOT:
             plt.close('all')
         cv2.destroyAllWindows()
