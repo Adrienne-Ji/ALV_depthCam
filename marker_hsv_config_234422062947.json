@@ -1,0 +1,54 @@
+{
+  "Purple": {
+    "enabled": false,
+    "hsv_low": [
+      120,
+      120,
+      80
+    ],
+    "hsv_high": [
+      165,
+      155,
+      175
+    ]
+  },
+  "Pink": {
+    "enabled": true,
+    "hsv_low": [
+      166,
+      66,
+      79
+    ],
+    "hsv_high": [
+      179,
+      149,
+      221
+    ]
+  },
+  "Green": {
+    "enabled": true,
+    "hsv_low": [
+      11,
+      111,
+      146
+    ],
+    "hsv_high": [
+      36,
+      222,
+      255
+    ]
+  },
+  "Yellow": {
+    "enabled": false,
+    "hsv_low": [
+      13,
+      151,
+      145
+    ],
+    "hsv_high": [
+      26,
+      214,
+      216
+    ]
+  }
+}

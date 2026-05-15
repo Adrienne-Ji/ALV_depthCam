@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 
 # Change this path to the folder where you put the realsense2.dll
 os.add_dll_directory(os.getcwd()) 
@@ -19,6 +20,9 @@ TAG_SIZE = 0.150          # Tag 0 (reference base) physical size: 15 cm
 TAG_SIZE_TRACKING = 0.03 # Tags 1 & 2 (device) physical size: 2.5 cm
 CSV_NAME = "heart_sim_output.csv"
 TARGET_FPS = 10            # Consistent output frame rate written to CSV (frames/sec)
+# Stream resolution/capture FPS — reduced automatically in dual-camera mode to stay within USB bandwidth.
+SINGLE_CAM_W, SINGLE_CAM_H, SINGLE_CAM_FPS = 1280, 720, 30
+DUAL_CAM_W,   DUAL_CAM_H,   DUAL_CAM_FPS   =  848, 480, 15
 ENABLE_PLOT = False       # Temporary: verify relative 3D pose of markers and midpoint
 PLOT_UPDATE_HZ = TARGET_FPS  # Plot redraw target; can be overridden by sync-to-recording mode
 SYNC_DRAW_TO_RECORDING = True  # Keep display/plot updates aligned to CSV write cadence
@@ -35,7 +39,7 @@ MARKER_AREA_MAX = 8000    # Maximum contour area — rejects large glare patches
 # channel expanded by this many units in each direction.  H and S are kept tight so that the
 # circularity filter remains the only false-positive guard.  Set to 0 to disable.
 SHADOW_V_SLACK = 90
-MARKER_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "marker_hsv_config.json")
+MARKER_CONFIG_FILE = None  # set per-instance in main() based on --serial
 # Rotate Tag 0 frame back to XY-plane convention when remap is enabled.
 # NOTE: This is the transpose (inverse) of the forward rotation to undo YZ mounting.
 R_YZ_TO_XY = np.array([
@@ -75,8 +79,7 @@ MARKERS = {
 
 
 def load_marker_config():
-    """Load persisted HSV overrides from disk if available."""
-    if not os.path.exists(MARKER_CONFIG_FILE):
+    if MARKER_CONFIG_FILE is None or not os.path.exists(MARKER_CONFIG_FILE):
         return
 
     try:
@@ -99,7 +102,8 @@ def load_marker_config():
 
 
 def save_marker_config():
-    """Persist current HSV thresholds so tuner saves survive restarts."""
+    if MARKER_CONFIG_FILE is None:
+        return
     saved = {}
     for name, cfg in MARKERS.items():
         saved[name] = {
@@ -107,7 +111,6 @@ def save_marker_config():
             'hsv_low': [int(v) for v in cfg['hsv_low']],
             'hsv_high': [int(v) for v in cfg['hsv_high']],
         }
-
     with open(MARKER_CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(saved, f, indent=2)
 
@@ -120,8 +123,6 @@ def build_timestamped_csv_path(base_name):
     stamp = str(int(time.time()))
     return f"{root}_{stamp}{ext}"
 
-
-load_marker_config()
 
 # Global variable for clicked point
 clicked_point = None
@@ -600,13 +601,40 @@ def detect_markers_scaled(detector, img_bgr, scale=1.0):
 
 # --- THE MAIN FUNCTION (THE CONDUCTOR) ---
 def main():
+    parser = argparse.ArgumentParser(description="Depth camera streaming and marker tracking.")
+    parser.add_argument("--serial", type=str, default=None,
+                        help="RealSense camera serial number (printed on the bottom of the device).")
+    parser.add_argument("--csv", type=str, default=None,
+                        help="Output CSV filename (default: auto-timestamped heart_sim_output).")
+    args = parser.parse_args()
+
+    # Per-instance config file so two cameras don't share HSV tuning
+    global MARKER_CONFIG_FILE
+    serial_tag = args.serial if args.serial else "default"
+    MARKER_CONFIG_FILE = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        f"marker_hsv_config_{serial_tag}.json"
+    )
+    load_marker_config()
+
+    # Window title includes serial so both windows are distinguishable
+    window_title = f"Real-Time Heart Tracker [{serial_tag}]"
+
     # Setup
-    csv_output_path = build_timestamped_csv_path(CSV_NAME)
+    base_csv = args.csv if args.csv else CSV_NAME
+    csv_output_path = build_timestamped_csv_path(base_csv)
     pipeline = rs.pipeline()
     config = rs.config()
-    config.enable_stream(rs.stream.color, 1280, 720,  rs.format.bgr8, 30)
-    config.enable_stream(rs.stream.depth, 1280, 720,  rs.format.z16,  30)
-    
+    if args.serial:
+        config.enable_device(args.serial)
+        cam_w, cam_h, cam_fps = DUAL_CAM_W, DUAL_CAM_H, DUAL_CAM_FPS
+        print(f"[Dual-cam mode] Serial {args.serial} — streaming at {cam_w}x{cam_h}@{cam_fps}fps")
+    else:
+        cam_w, cam_h, cam_fps = SINGLE_CAM_W, SINGLE_CAM_H, SINGLE_CAM_FPS
+        print(f"[Single-cam mode] Streaming at {cam_w}x{cam_h}@{cam_fps}fps")
+    config.enable_stream(rs.stream.color, cam_w, cam_h, rs.format.bgr8, cam_fps)
+    config.enable_stream(rs.stream.depth, cam_w, cam_h, rs.format.z16,  cam_fps)
+
     try:
         profile = pipeline.start(config)
         color_vsp = profile.get_stream(rs.stream.color).as_video_stream_profile()
@@ -1014,7 +1042,7 @@ def main():
             
             if (not SYNC_DRAW_TO_RECORDING) or do_write or in_warmup:
                 t0 = time.perf_counter()
-                cv2.imshow("Real-Time Heart Tracker", display_img)
+                cv2.imshow(window_title, display_img)
                 perf_add("display", time.perf_counter() - t0)
 
             # Update 3D plot at a limited cadence so Matplotlib does not throttle acquisition.
