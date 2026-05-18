@@ -23,7 +23,8 @@ TAG_SIZE_TRACKING = 0.03 # Tags 1 & 2 (device) physical size: 3 cm
 CALIB_TAG_IDS  = [3, 4, 5]   # IDs of the extra calibration-only tags
 CALIB_TAG_SIZE = 0.05         # physical size of the extra calibration tags (metres)
 CSV_NAME = "heart_sim_output.csv"
-DEPTH_CALIB_FILE = "depth_calibration.json"
+DEPTH_CALIB_FILE  = "depth_calibration.json"
+DEPTH_PRESET_FILE = "mediumDensityCamSettings.json"  # filename in same folder as this script; set to None to skip
 DEPTH_SCALE_M  = 1.0      # Multiplicative depth correction: corrected = raw * DEPTH_SCALE_M + DEPTH_OFFSET_M
 DEPTH_OFFSET_M = 0.0      # Additive depth correction (metres)
 TARGET_FPS = 10            # Consistent output frame rate written to CSV (frames/sec)
@@ -797,8 +798,9 @@ def main():
     config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
     config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16,  30)
 
-    if args.preset:
-        apply_device_preset(None, args.preset)
+    preset_to_load = args.preset or DEPTH_PRESET_FILE
+    if preset_to_load:
+        apply_device_preset(None, preset_to_load)
 
     try:
         profile = pipeline.start(config)
