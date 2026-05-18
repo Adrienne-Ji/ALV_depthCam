@@ -17,14 +17,16 @@ from collections import deque
 
 # --- SETTINGS ---
 TAG_SIZE = 0.150          # Tag 0 (reference base) physical size: 15 cm
-TAG_SIZE_TRACKING = 0.03 # Tags 1 & 2 (device) physical size: 2.5 cm
+TAG_SIZE_TRACKING = 0.03 # Tags 1 & 2 (device) physical size: 3 cm
+# Extra tags used only during depth calibration — add as many as you like.
+# Set CALIB_TAG_SIZE to their physical side length in metres.
+CALIB_TAG_IDS  = [3, 4, 5]   # IDs of the extra calibration-only tags
+CALIB_TAG_SIZE = 0.05         # physical size of the extra calibration tags (metres)
 CSV_NAME = "heart_sim_output.csv"
 DEPTH_CALIB_FILE = "depth_calibration.json"
-DEPTH_OFFSET_M = 0.0      # Additive correction applied to all depth readings (metres); set by 'c' calibration
+DEPTH_SCALE_M  = 1.0      # Multiplicative depth correction: corrected = raw * DEPTH_SCALE_M + DEPTH_OFFSET_M
+DEPTH_OFFSET_M = 0.0      # Additive depth correction (metres)
 TARGET_FPS = 10            # Consistent output frame rate written to CSV (frames/sec)
-# Stream resolution/capture FPS — reduced automatically in dual-camera mode to stay within USB bandwidth.
-SINGLE_CAM_W, SINGLE_CAM_H, SINGLE_CAM_FPS = 1280, 720, 30
-DUAL_CAM_W,   DUAL_CAM_H,   DUAL_CAM_FPS   =  848, 480, 15
 ENABLE_PLOT = False       # Temporary: verify relative 3D pose of markers and midpoint
 PLOT_UPDATE_HZ = TARGET_FPS  # Plot redraw target; can be overridden by sync-to-recording mode
 SYNC_DRAW_TO_RECORDING = True  # Keep display/plot updates aligned to CSV write cadence
@@ -118,44 +120,56 @@ def save_marker_config():
 
 
 def load_depth_calibration():
-    global DEPTH_OFFSET_M
+    global DEPTH_SCALE_M, DEPTH_OFFSET_M
     if not os.path.exists(DEPTH_CALIB_FILE):
         return
     try:
         with open(DEPTH_CALIB_FILE, 'r') as f:
             data = json.load(f)
+        DEPTH_SCALE_M  = float(data.get("depth_scale_m",  1.0))
         DEPTH_OFFSET_M = float(data.get("depth_offset_m", 0.0))
-        print(f"[Depth Calib] Loaded offset: {DEPTH_OFFSET_M*100:.2f} cm")
+        print(f"[Depth Calib] Loaded — scale: {DEPTH_SCALE_M:.6f}  offset: {DEPTH_OFFSET_M*100:+.2f} cm")
     except (OSError, json.JSONDecodeError, ValueError):
         pass
 
 
 def save_depth_calibration():
     with open(DEPTH_CALIB_FILE, 'w') as f:
-        json.dump({"depth_offset_m": DEPTH_OFFSET_M}, f, indent=2)
-    print(f"[Depth Calib] Saved offset: {DEPTH_OFFSET_M*100:.2f} cm → {DEPTH_CALIB_FILE}")
+        json.dump({"depth_scale_m": DEPTH_SCALE_M, "depth_offset_m": DEPTH_OFFSET_M}, f, indent=2)
+    print(f"[Depth Calib] Saved — scale: {DEPTH_SCALE_M:.6f}  offset: {DEPTH_OFFSET_M*100:+.2f} cm → {DEPTH_CALIB_FILE}")
 
 
-def run_depth_calibration(pipeline, align, intr, depth_scale, detector, n_frames=40):
+def run_depth_calibration(pipeline, align, intr, depth_scale, detector, n_samples=2000):
     """
-    Collect n_frames where Tag 0 is clearly visible.  For each frame, compare
-    the PnP-derived Z (AprilTag ground truth) with the depth sensor reading at
-    the tag centre and accumulate the difference.  The mean offset is stored in
-    the global DEPTH_OFFSET_M and saved to DEPTH_CALIB_FILE.
+    Fit a linear depth correction (corrected = raw * scale + offset) using all
+    three AprilTags (0, 1, 2) as simultaneous PnP ground-truth references.
 
-    Press ESC in the calibration window to abort early.
+    With three tags at different distances in each frame, a single session covers
+    a range of depths without the user needing to move the camera.  Move the
+    device (Tags 1 & 2) closer and farther during calibration to sweep the range.
+
+    Press ESC to abort.  Results saved to DEPTH_CALIB_FILE.
     """
-    global DEPTH_OFFSET_M
+    global DEPTH_SCALE_M, DEPTH_OFFSET_M
     cam_mtx = np.array([[intr.fx, 0, intr.ppx], [0, intr.fy, intr.ppy], [0, 0, 1]])
     dist_coeffs = np.zeros(5)
 
-    offsets = []
-    win = "Depth Calibration — point Tag 0 at camera  |  ESC to abort"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win, 800, 150)
+    # (tag_id -> physical size) for PnP — Tag 0 is larger so its PnP is more accurate
+    TAG_SIZES = {0: TAG_SIZE, 1: TAG_SIZE_TRACKING, 2: TAG_SIZE_TRACKING}
+    for _id in CALIB_TAG_IDS:
+        TAG_SIZES[_id] = CALIB_TAG_SIZE
 
-    print(f"[Depth Calib] Starting: need {n_frames} frames with Tag 0 visible…")
-    while len(offsets) < n_frames:
+    raw_vals  = []   # depth sensor readings (m)
+    pnp_vals  = []   # PnP ground-truth Z (m)
+    tag_counts = {tid: 0 for tid in TAG_SIZES}
+
+    win = "Depth Calibration — move device closer/farther  |  ESC to abort"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, 900, 180)
+
+    print(f"[Depth Calib] Move the device (Tags 1 & 2) through its full depth range. Need {n_samples} samples…")
+
+    while len(raw_vals) < n_samples:
         frames = pipeline.wait_for_frames()
         aligned_frames = align.process(frames)
         color_frame = aligned_frames.get_color_frame()
@@ -166,64 +180,111 @@ def run_depth_calibration(pipeline, align, intr, depth_scale, detector, n_frames
         img         = np.asanyarray(color_frame.get_data())
         depth_image = np.asanyarray(depth_frame.get_data())
         gray        = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        h_d, w_d    = depth_image.shape[:2]
 
         corners, ids, _ = detector.detectMarkers(gray)
-        if ids is None or 0 not in ids.flatten():
-            overlay = np.zeros((150, 800, 3), dtype=np.uint8)
-            cv2.putText(overlay, "Tag 0 NOT detected — aim camera at the base tag",
-                        (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 80, 255), 2)
-            cv2.imshow(win, overlay)
-            if (cv2.waitKey(1) & 0xFF) == 27:
-                break
-            continue
+        ids_flat = ids.flatten() if ids is not None else []
 
-        idx_tag = np.where(ids.flatten() == 0)[0][0]
-        _, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-            corners[idx_tag], TAG_SIZE, cam_mtx, dist_coeffs)
-        pnp_z = float(tvecs[0].flatten()[2])
+        frame_added = 0
+        for tag_id, tag_sz in TAG_SIZES.items():
+            if tag_id not in ids_flat:
+                continue
+            idx = np.where(ids_flat == tag_id)[0][0]
+            _, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
+                corners[idx], tag_sz, cam_mtx, dist_coeffs)
+            pnp_z = float(tvecs[0].flatten()[2])
+            if not (0.05 <= pnp_z <= 3.0):
+                continue
 
-        center   = corners[idx_tag][0].mean(axis=0)
-        cx_t, cy_t = int(center[0]), int(center[1])
-        h_d, w_d = depth_image.shape[:2]
+            center = corners[idx][0].mean(axis=0)
+            cx_t, cy_t = int(center[0]), int(center[1])
+            dist_d = None
+            for R in (10, 20, 35):
+                y1, y2 = max(0, cy_t - R), min(h_d, cy_t + R + 1)
+                x1, x2 = max(0, cx_t - R), min(w_d, cx_t + R + 1)
+                patch = depth_image[y1:y2, x1:x2] * depth_scale
+                valid = patch[(patch > 0.05) & (patch <= 3.0)]
+                if len(valid) >= 3:
+                    dist_d = float(np.median(valid))
+                    break
+            if dist_d is None:
+                continue
 
-        dist_d = None
-        for R in (10, 20, 35):
-            y1, y2 = max(0, cy_t - R), min(h_d, cy_t + R + 1)
-            x1, x2 = max(0, cx_t - R), min(w_d, cx_t + R + 1)
-            patch = depth_image[y1:y2, x1:x2] * depth_scale
-            valid = patch[(patch > 0.05) & (patch <= 3.0)]
-            if len(valid) >= 3:
-                dist_d = float(np.median(valid))
-                break
+            raw_vals.append(dist_d)
+            pnp_vals.append(pnp_z)
+            tag_counts[tag_id] += 1
+            frame_added += 1
 
-        if dist_d is None:
-            continue
-
-        offset = pnp_z - dist_d
-        offsets.append(offset)
-
-        overlay = np.zeros((150, 800, 3), dtype=np.uint8)
+        overlay = np.zeros((180, 900, 3), dtype=np.uint8)
+        depth_range = f"{min(raw_vals)*100:.0f}–{max(raw_vals)*100:.0f} cm" if raw_vals else "---"
         cv2.putText(overlay,
-                    f"Frame {len(offsets)}/{n_frames}  |  PnP Z={pnp_z*100:.2f}cm  Depth={dist_d*100:.2f}cm  offset={offset*100:+.2f}cm",
-                    (15, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 0), 2)
-        if offsets:
-            cv2.putText(overlay,
-                        f"Running mean offset: {np.mean(offsets)*100:+.2f} cm",
-                        (15, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
+                    f"Samples: {len(raw_vals)}/{n_samples}   Depth range covered: {depth_range}",
+                    (15, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 0), 2)
+        counts_str = "   ".join(f"Tag{tid}: {tag_counts[tid]}" for tid in sorted(tag_counts))
+        cv2.putText(overlay, counts_str,
+                    (15, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+        cv2.putText(overlay,
+                    "Move device closer and farther to cover full depth range",
+                    (15, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
         cv2.imshow(win, overlay)
         if (cv2.waitKey(1) & 0xFF) == 27:
             break
 
     cv2.destroyWindow(win)
 
-    if not offsets:
-        print("[Depth Calib] Aborted — no frames collected.")
+    if len(raw_vals) < 10:
+        print("[Depth Calib] Aborted — not enough samples.")
         return
 
-    DEPTH_OFFSET_M = float(np.mean(offsets))
-    std_cm = np.std(offsets) * 100
-    print(f"[Depth Calib] Offset = {DEPTH_OFFSET_M*100:+.2f} cm  (std {std_cm:.2f} cm, {len(offsets)} frames)")
+    # Linear least-squares fit: pnp_z = scale * raw_z + offset
+    raw_arr = np.array(raw_vals)
+    pnp_arr = np.array(pnp_vals)
+    coeffs  = np.polyfit(raw_arr, pnp_arr, 1)   # [scale, offset]
+    DEPTH_SCALE_M  = float(coeffs[0])
+    DEPTH_OFFSET_M = float(coeffs[1])
+
+    residuals_cm = (pnp_arr - (raw_arr * DEPTH_SCALE_M + DEPTH_OFFSET_M)) * 100
+    print(f"[Depth Calib] scale={DEPTH_SCALE_M:.6f}  offset={DEPTH_OFFSET_M*100:+.2f} cm  "
+          f"residual std={np.std(residuals_cm):.2f} cm  ({len(raw_vals)} samples, "
+          f"range {raw_arr.min()*100:.0f}–{raw_arr.max()*100:.0f} cm)")
     save_depth_calibration()
+
+
+def apply_device_preset(serial, preset_path):
+    """Enable RS400 advanced mode on the target device and load a JSON preset file.
+
+    Enabling advanced mode causes the device to reset; we re-enumerate after the
+    reset and confirm the mode is active before loading the preset.
+    """
+    def _find_device(ctx, sn):
+        for d in ctx.devices:
+            if sn is None or d.get_info(rs.camera_info.serial_number) == sn:
+                return d
+        return None
+
+    ctx = rs.context()
+    dev = _find_device(ctx, serial)
+    if dev is None:
+        print(f"[Preset] Device {serial or 'any'} not found — skipping preset load.")
+        return
+
+    advnc_mode = rs.rs400_advanced_mode(dev)
+    if not advnc_mode.is_enabled():
+        print("[Preset] Advanced mode not enabled — enabling now (device will reset, waiting 5 s)…")
+        advnc_mode.toggle_advanced_mode(True)
+        time.sleep(5)
+        ctx = rs.context()
+        sn = dev.get_info(rs.camera_info.serial_number)
+        dev = _find_device(ctx, sn)
+        if dev is None:
+            print("[Preset] Device not found after reset — skipping preset load.")
+            return
+        advnc_mode = rs.rs400_advanced_mode(dev)
+
+    with open(preset_path, 'r') as f:
+        json_str = f.read()
+    advnc_mode.load_json(json_str)
+    print(f"[Preset] Loaded: {preset_path}")
 
 
 def build_timestamped_csv_path(base_name):
@@ -413,7 +474,7 @@ def _find_circular_blobs(mask, depth_image, depth_scale, intr):
             patch_m = depth_image[y1:y2, x1:x2] * depth_scale
             valid = patch_m[(patch_m > 0.05) & (patch_m <= 3.0)]
             if len(valid) >= 3:
-                dist = float(np.median(valid)) + DEPTH_OFFSET_M
+                dist = float(np.median(valid)) * DEPTH_SCALE_M + DEPTH_OFFSET_M
                 break
         if dist is None:
             continue
@@ -564,7 +625,7 @@ def detect_base_tag(img, intr, corners, ids, depth_image=None, depth_scale=1.0):
             patch_m = depth_image[y1:y2, x1:x2] * depth_scale
             valid = patch_m[(patch_m > 0.05) & (patch_m <= 3.0)]
             if len(valid) >= 3:
-                dist_d = float(np.median(valid)) + DEPTH_OFFSET_M
+                dist_d = float(np.median(valid)) * DEPTH_SCALE_M + DEPTH_OFFSET_M
                 break
         if dist_d is not None:
             xyz = rs.rs2_deproject_pixel_to_point(intr, [cx_t, cy_t], dist_d)
@@ -622,7 +683,7 @@ def detect_other_tags(img, intr, base_T, base_rvec, corners, ids, depth_image=No
                 patch_m = depth_image[y1:y2, x1:x2] * depth_scale
                 valid = patch_m[(patch_m > 0.05) & (patch_m <= 3.0)]
                 if len(valid) >= 3:
-                    dist_d = float(np.median(valid)) + DEPTH_OFFSET_M
+                    dist_d = float(np.median(valid)) * DEPTH_SCALE_M + DEPTH_OFFSET_M
                     break
             if dist_d is not None:
                 xyz = rs.rs2_deproject_pixel_to_point(intr, [cx_t, cy_t], dist_d)
@@ -713,41 +774,31 @@ def detect_markers_scaled(detector, img_bgr, scale=1.0):
 # --- THE MAIN FUNCTION (THE CONDUCTOR) ---
 def main():
     parser = argparse.ArgumentParser(description="Depth camera streaming and marker tracking.")
-    parser.add_argument("--serial", type=str, default=None,
-                        help="RealSense camera serial number (printed on the bottom of the device).")
     parser.add_argument("--csv", type=str, default=None,
                         help="Output CSV filename (default: auto-timestamped heart_sim_output).")
+    parser.add_argument("--preset", type=str, default=None,
+                        help="Path to a RealSense JSON preset file (e.g. HighAccuracyPreset.json).")
+    parser.add_argument("--recalibrate", action="store_true",
+                        help="Force a fresh depth calibration even if a saved one exists.")
     args = parser.parse_args()
 
-    # Per-instance config file so two cameras don't share HSV tuning
     global MARKER_CONFIG_FILE
-    serial_tag = args.serial if args.serial else "default"
-    MARKER_CONFIG_FILE = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        f"marker_hsv_config_{serial_tag}.json"
-    )
+    MARKER_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "marker_hsv_config.json")
     load_marker_config()
     load_depth_calibration()
 
-    # Window title includes serial so both windows are distinguishable
-    window_title = f"Real-Time Heart Tracker [{serial_tag}]"
+    window_title = "Real-Time Heart Tracker"
 
     # Setup
     base_csv = args.csv if args.csv else CSV_NAME
     csv_output_path = build_timestamped_csv_path(base_csv)
     pipeline = rs.pipeline()
     config = rs.config()
-    if args.serial:
-        config.enable_device(args.serial)
-        cam_w, cam_h, cam_fps = DUAL_CAM_W, DUAL_CAM_H, DUAL_CAM_FPS
-        detect_scale = 1.0  # already lower resolution — don't downscale further or small tags vanish
-        print(f"[Dual-cam mode] Serial {args.serial} — streaming at {cam_w}x{cam_h}@{cam_fps}fps, detect scale 1.0")
-    else:
-        cam_w, cam_h, cam_fps = SINGLE_CAM_W, SINGLE_CAM_H, SINGLE_CAM_FPS
-        detect_scale = ARUCO_DETECT_SCALE
-        print(f"[Single-cam mode] Streaming at {cam_w}x{cam_h}@{cam_fps}fps, detect scale {detect_scale}")
-    config.enable_stream(rs.stream.color, cam_w, cam_h, rs.format.bgr8, cam_fps)
-    config.enable_stream(rs.stream.depth, cam_w, cam_h, rs.format.z16,  cam_fps)
+    config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
+    config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16,  30)
+
+    if args.preset:
+        apply_device_preset(None, args.preset)
 
     try:
         profile = pipeline.start(config)
@@ -788,6 +839,13 @@ def main():
         cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11),
         aruco_params
     )
+
+    # Depth calibration — run once before data collection starts
+    if args.recalibrate or not os.path.exists(DEPTH_CALIB_FILE):
+        print("[Depth Calib] Running calibration — move Tags 1 & 2 through the full depth range.")
+        run_depth_calibration(pipeline, align, intr, depth_scale, detector)
+    else:
+        print(f"[Depth Calib] Using saved calibration from {DEPTH_CALIB_FILE}. Pass --recalibrate to redo.")
 
     # Initialize CSV with mocap-compatible 6-row header
     enabled_markers = [name for name, cfg in MARKERS.items() if cfg.get('enabled', True)]
@@ -930,7 +988,7 @@ def main():
 
             key = cv2.waitKey(1) & 0xFF
 
-            # Keypress: c = depth calibration, t = HSV tuner, q = quit
+            # Keypress: c = recalibrate depth, t = HSV tuner, q = quit
             if key == ord('c'):
                 run_depth_calibration(pipeline, align, intr, depth_scale, detector)
                 continue
@@ -989,7 +1047,7 @@ def main():
 
             # 1. Run ArUco detection (write/warmup frames only)
             t0 = time.perf_counter()
-            all_corners, all_ids, _ = detect_markers_scaled(detector, img, detect_scale)
+            all_corners, all_ids, _ = detect_markers_scaled(detector, img, ARUCO_DETECT_SCALE)
             perf_add("aruco_detect", time.perf_counter() - t0)
 
             # 1a. Detect base tag (Tag 0)
