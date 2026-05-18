@@ -28,7 +28,7 @@ PLOT_UPDATE_HZ = TARGET_FPS  # Plot redraw target; can be overridden by sync-to-
 SYNC_DRAW_TO_RECORDING = True  # Keep display/plot updates aligned to CSV write cadence
 ENABLE_PERF_LOG = False   # Print per-stage timing so bottlenecks are visible in terminal
 PERF_LOG_INTERVAL_S = 2.0 # Seconds between profiler summaries
-ARUCO_DETECT_SCALE = 0.5  # Run tag detection on downscaled frame, then scale corners back up
+ARUCO_DETECT_SCALE = 0.5  # Run tag detection on downscaled frame (single-cam); set to 1.0 in dual-cam mode automatically
 FAST_ARUCO_MODE = True    # Relax expensive ArUco options to recover real-time performance
 WARMUP_S = 2.0            # Seconds of pre-detection before CSV recording starts (pre-warms colour cache)
 USE_TAG0_YZ_TO_XY_REMAP = False  # True when Tag 0 is physically mounted on the YZ plane
@@ -628,10 +628,12 @@ def main():
     if args.serial:
         config.enable_device(args.serial)
         cam_w, cam_h, cam_fps = DUAL_CAM_W, DUAL_CAM_H, DUAL_CAM_FPS
-        print(f"[Dual-cam mode] Serial {args.serial} — streaming at {cam_w}x{cam_h}@{cam_fps}fps")
+        detect_scale = 1.0  # already lower resolution — don't downscale further or small tags vanish
+        print(f"[Dual-cam mode] Serial {args.serial} — streaming at {cam_w}x{cam_h}@{cam_fps}fps, detect scale 1.0")
     else:
         cam_w, cam_h, cam_fps = SINGLE_CAM_W, SINGLE_CAM_H, SINGLE_CAM_FPS
-        print(f"[Single-cam mode] Streaming at {cam_w}x{cam_h}@{cam_fps}fps")
+        detect_scale = ARUCO_DETECT_SCALE
+        print(f"[Single-cam mode] Streaming at {cam_w}x{cam_h}@{cam_fps}fps, detect scale {detect_scale}")
     config.enable_stream(rs.stream.color, cam_w, cam_h, rs.format.bgr8, cam_fps)
     config.enable_stream(rs.stream.depth, cam_w, cam_h, rs.format.z16,  cam_fps)
 
@@ -871,7 +873,7 @@ def main():
 
             # 1. Run ArUco detection (write/warmup frames only)
             t0 = time.perf_counter()
-            all_corners, all_ids, _ = detect_markers_scaled(detector, img, ARUCO_DETECT_SCALE)
+            all_corners, all_ids, _ = detect_markers_scaled(detector, img, detect_scale)
             perf_add("aruco_detect", time.perf_counter() - t0)
 
             # 1a. Detect base tag (Tag 0)
