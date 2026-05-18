@@ -19,6 +19,8 @@ from collections import deque
 TAG_SIZE = 0.150          # Tag 0 (reference base) physical size: 15 cm
 TAG_SIZE_TRACKING = 0.03 # Tags 1 & 2 (device) physical size: 2.5 cm
 CSV_NAME = "heart_sim_output.csv"
+DEPTH_CALIB_FILE = "depth_calibration.json"
+DEPTH_OFFSET_M = 0.0      # Additive correction applied to all depth readings (metres); set by 'c' calibration
 TARGET_FPS = 10            # Consistent output frame rate written to CSV (frames/sec)
 # Stream resolution/capture FPS — reduced automatically in dual-camera mode to stay within USB bandwidth.
 SINGLE_CAM_W, SINGLE_CAM_H, SINGLE_CAM_FPS = 1280, 720, 30
@@ -113,6 +115,115 @@ def save_marker_config():
         }
     with open(MARKER_CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(saved, f, indent=2)
+
+
+def load_depth_calibration():
+    global DEPTH_OFFSET_M
+    if not os.path.exists(DEPTH_CALIB_FILE):
+        return
+    try:
+        with open(DEPTH_CALIB_FILE, 'r') as f:
+            data = json.load(f)
+        DEPTH_OFFSET_M = float(data.get("depth_offset_m", 0.0))
+        print(f"[Depth Calib] Loaded offset: {DEPTH_OFFSET_M*100:.2f} cm")
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+
+
+def save_depth_calibration():
+    with open(DEPTH_CALIB_FILE, 'w') as f:
+        json.dump({"depth_offset_m": DEPTH_OFFSET_M}, f, indent=2)
+    print(f"[Depth Calib] Saved offset: {DEPTH_OFFSET_M*100:.2f} cm → {DEPTH_CALIB_FILE}")
+
+
+def run_depth_calibration(pipeline, align, intr, depth_scale, detector, n_frames=40):
+    """
+    Collect n_frames where Tag 0 is clearly visible.  For each frame, compare
+    the PnP-derived Z (AprilTag ground truth) with the depth sensor reading at
+    the tag centre and accumulate the difference.  The mean offset is stored in
+    the global DEPTH_OFFSET_M and saved to DEPTH_CALIB_FILE.
+
+    Press ESC in the calibration window to abort early.
+    """
+    global DEPTH_OFFSET_M
+    cam_mtx = np.array([[intr.fx, 0, intr.ppx], [0, intr.fy, intr.ppy], [0, 0, 1]])
+    dist_coeffs = np.zeros(5)
+
+    offsets = []
+    win = "Depth Calibration — point Tag 0 at camera  |  ESC to abort"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, 800, 150)
+
+    print(f"[Depth Calib] Starting: need {n_frames} frames with Tag 0 visible…")
+    while len(offsets) < n_frames:
+        frames = pipeline.wait_for_frames()
+        aligned_frames = align.process(frames)
+        color_frame = aligned_frames.get_color_frame()
+        depth_frame  = aligned_frames.get_depth_frame()
+        if not color_frame or not depth_frame:
+            continue
+
+        img         = np.asanyarray(color_frame.get_data())
+        depth_image = np.asanyarray(depth_frame.get_data())
+        gray        = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        corners, ids, _ = detector.detectMarkers(gray)
+        if ids is None or 0 not in ids.flatten():
+            overlay = np.zeros((150, 800, 3), dtype=np.uint8)
+            cv2.putText(overlay, "Tag 0 NOT detected — aim camera at the base tag",
+                        (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 80, 255), 2)
+            cv2.imshow(win, overlay)
+            if (cv2.waitKey(1) & 0xFF) == 27:
+                break
+            continue
+
+        idx_tag = np.where(ids.flatten() == 0)[0][0]
+        _, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
+            corners[idx_tag], TAG_SIZE, cam_mtx, dist_coeffs)
+        pnp_z = float(tvecs[0].flatten()[2])
+
+        center   = corners[idx_tag][0].mean(axis=0)
+        cx_t, cy_t = int(center[0]), int(center[1])
+        h_d, w_d = depth_image.shape[:2]
+
+        dist_d = None
+        for R in (10, 20, 35):
+            y1, y2 = max(0, cy_t - R), min(h_d, cy_t + R + 1)
+            x1, x2 = max(0, cx_t - R), min(w_d, cx_t + R + 1)
+            patch = depth_image[y1:y2, x1:x2] * depth_scale
+            valid = patch[(patch > 0.05) & (patch <= 3.0)]
+            if len(valid) >= 3:
+                dist_d = float(np.median(valid))
+                break
+
+        if dist_d is None:
+            continue
+
+        offset = pnp_z - dist_d
+        offsets.append(offset)
+
+        overlay = np.zeros((150, 800, 3), dtype=np.uint8)
+        cv2.putText(overlay,
+                    f"Frame {len(offsets)}/{n_frames}  |  PnP Z={pnp_z*100:.2f}cm  Depth={dist_d*100:.2f}cm  offset={offset*100:+.2f}cm",
+                    (15, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 0), 2)
+        if offsets:
+            cv2.putText(overlay,
+                        f"Running mean offset: {np.mean(offsets)*100:+.2f} cm",
+                        (15, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
+        cv2.imshow(win, overlay)
+        if (cv2.waitKey(1) & 0xFF) == 27:
+            break
+
+    cv2.destroyWindow(win)
+
+    if not offsets:
+        print("[Depth Calib] Aborted — no frames collected.")
+        return
+
+    DEPTH_OFFSET_M = float(np.mean(offsets))
+    std_cm = np.std(offsets) * 100
+    print(f"[Depth Calib] Offset = {DEPTH_OFFSET_M*100:+.2f} cm  (std {std_cm:.2f} cm, {len(offsets)} frames)")
+    save_depth_calibration()
 
 
 def build_timestamped_csv_path(base_name):
@@ -302,7 +413,7 @@ def _find_circular_blobs(mask, depth_image, depth_scale, intr):
             patch_m = depth_image[y1:y2, x1:x2] * depth_scale
             valid = patch_m[(patch_m > 0.05) & (patch_m <= 3.0)]
             if len(valid) >= 3:
-                dist = float(np.median(valid))
+                dist = float(np.median(valid)) + DEPTH_OFFSET_M
                 break
         if dist is None:
             continue
@@ -453,7 +564,7 @@ def detect_base_tag(img, intr, corners, ids, depth_image=None, depth_scale=1.0):
             patch_m = depth_image[y1:y2, x1:x2] * depth_scale
             valid = patch_m[(patch_m > 0.05) & (patch_m <= 3.0)]
             if len(valid) >= 3:
-                dist_d = float(np.median(valid))
+                dist_d = float(np.median(valid)) + DEPTH_OFFSET_M
                 break
         if dist_d is not None:
             xyz = rs.rs2_deproject_pixel_to_point(intr, [cx_t, cy_t], dist_d)
@@ -511,7 +622,7 @@ def detect_other_tags(img, intr, base_T, base_rvec, corners, ids, depth_image=No
                 patch_m = depth_image[y1:y2, x1:x2] * depth_scale
                 valid = patch_m[(patch_m > 0.05) & (patch_m <= 3.0)]
                 if len(valid) >= 3:
-                    dist_d = float(np.median(valid))
+                    dist_d = float(np.median(valid)) + DEPTH_OFFSET_M
                     break
             if dist_d is not None:
                 xyz = rs.rs2_deproject_pixel_to_point(intr, [cx_t, cy_t], dist_d)
@@ -616,6 +727,7 @@ def main():
         f"marker_hsv_config_{serial_tag}.json"
     )
     load_marker_config()
+    load_depth_calibration()
 
     # Window title includes serial so both windows are distinguishable
     window_title = f"Real-Time Heart Tracker [{serial_tag}]"
@@ -818,7 +930,11 @@ def main():
 
             key = cv2.waitKey(1) & 0xFF
 
-            # Keypress: t = HSV tuner, q = quit
+            # Keypress: c = depth calibration, t = HSV tuner, q = quit
+            if key == ord('c'):
+                run_depth_calibration(pipeline, align, intr, depth_scale, detector)
+                continue
+
             if key == ord('t'):
                 color_keys = list(MARKERS.keys())
                 print("\n[HSV Tuner] Select colour to tune:")
