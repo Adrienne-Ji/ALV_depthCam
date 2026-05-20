@@ -918,8 +918,9 @@ def main():
         frame_times = deque(maxlen=30)
         write_times = deque(maxlen=30)
         start_time = time.time()
-        next_write_due_s = None
-        write_interval_s = 1.0 / TARGET_FPS
+        next_write_due_s  = None
+        recording_start_s = None
+        write_interval_s  = 1.0 / TARGET_FPS
         last_plot_time = 0.0          # wall-clock time of last 3D plot update
         last_display_circles = {}     # name -> list of (px, py) — drawn every frame for stable display
         # Persistence cache for colour markers: name -> (points_list, timestamp)
@@ -982,6 +983,7 @@ def main():
 
             if next_write_due_s is None and not in_warmup:
                 next_write_due_s = now_wall_s
+                recording_start_s = now_wall_s
             slots_due = 0
             if not in_warmup and now_wall_s >= next_write_due_s:
                 slots_due = int((now_wall_s - next_write_due_s) // write_interval_s) + 1
@@ -1166,9 +1168,11 @@ def main():
                 for marker_mm, _bgr, _name in marker_data:
                     if _name not in detected_lookup:
                         detected_lookup[_name] = marker_mm
-                for _ in range(slots_due):
-                    nominal_time = frame_count / TARGET_FPS
-                    csv_row = [frame_count, f"{nominal_time:.4f}"]
+                # Time of the first slot in this batch, then spaced by write_interval_s
+                batch_start_s = next_write_due_s - slots_due * write_interval_s
+                for slot_i in range(slots_due):
+                    true_time = (batch_start_s + slot_i * write_interval_s) - recording_start_s
+                    csv_row = [frame_count, f"{true_time:.6f}"]
                     tag0_present = T_base is not None
                     csv_row += ["0.000000", "0.000000", "0.000000"] if tag0_present else ["", "", ""]
                     for pos_m in [tag1_world, tag2_world, midpoint_world]:
