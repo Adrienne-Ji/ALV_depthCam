@@ -89,16 +89,20 @@ SHADOW_V_SLACK   = 90        # V-channel slack for shadow fallback
 
 MARKERS = {
     "Pink": {
-        "enabled":  True,
-        "hsv_low":  np.array([131, 104, 165]),
-        "hsv_high": np.array([169, 134, 197]),
-        "bgr":      (147, 20, 255),
+        "enabled":   True,
+        "hsv_low":   np.array([131, 104, 165]),
+        "hsv_high":  np.array([169, 134, 197]),
+        "hsv_low_2":  None,   # cam2 override — None means use cam1 values
+        "hsv_high_2": None,
+        "bgr":       (147, 20, 255),
     },
     "Green": {
-        "enabled":  True,
-        "hsv_low":  np.array([ 38,  77, 128]),
-        "hsv_high": np.array([ 68, 166, 146]),
-        "bgr":      (0, 255, 0),
+        "enabled":   True,
+        "hsv_low":   np.array([ 38,  77, 128]),
+        "hsv_high":  np.array([ 68, 166, 146]),
+        "hsv_low_2":  None,
+        "hsv_high_2": None,
+        "bgr":       (0, 255, 0),
     },
 }
 
@@ -134,19 +138,27 @@ def load_marker_config():
             MARKERS[name]["hsv_low"]  = np.array(cfg["hsv_low"],  dtype=int)
         if isinstance(cfg.get("hsv_high"), list):
             MARKERS[name]["hsv_high"] = np.array(cfg["hsv_high"], dtype=int)
+        if isinstance(cfg.get("hsv_low_2"),  list):
+            MARKERS[name]["hsv_low_2"]  = np.array(cfg["hsv_low_2"],  dtype=int)
+        if isinstance(cfg.get("hsv_high_2"), list):
+            MARKERS[name]["hsv_high_2"] = np.array(cfg["hsv_high_2"], dtype=int)
         if "enabled" in cfg:
             MARKERS[name]["enabled"] = bool(cfg["enabled"])
 
 
 def save_marker_config():
-    saved = {
-        name: {
+    saved = {}
+    for name, cfg in MARKERS.items():
+        entry = {
             "enabled":  bool(cfg.get("enabled", True)),
             "hsv_low":  [int(v) for v in cfg["hsv_low"]],
             "hsv_high": [int(v) for v in cfg["hsv_high"]],
         }
-        for name, cfg in MARKERS.items()
-    }
+        if cfg.get("hsv_low_2")  is not None:
+            entry["hsv_low_2"]  = [int(v) for v in cfg["hsv_low_2"]]
+        if cfg.get("hsv_high_2") is not None:
+            entry["hsv_high_2"] = [int(v) for v in cfg["hsv_high_2"]]
+        saved[name] = entry
     with open(MARKER_CFG_FILE, "w") as f:
         json.dump(saved, f, indent=2)
 
@@ -487,14 +499,14 @@ def detect_tags_rgb(img, K, D, detector, display_img=None):
 # HSV TUNER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def hsv_tuner(pipe, K, D, color_name, initial_low, initial_high):
+def hsv_tuner(pipe, K, D, color_name, initial_low, initial_high, cam_label="cam1"):
     """
-    Interactive HSV threshold tuner using camera 1's live feed.
+    Interactive HSV threshold tuner using the supplied camera's live feed.
     Press 's' to save, 'q'/ESC to cancel.
     """
-    WIN_CTRL   = f"HSV Tuner: {color_name} — Controls  (s=save  r=reset  q=quit)"
-    WIN_MASK   = f"HSV Tuner: {color_name} — Mask"
-    WIN_RESULT = f"HSV Tuner: {color_name} — Result"
+    WIN_CTRL   = f"HSV Tuner: {color_name} [{cam_label}] — Controls  (s=save  r=reset  q=quit)"
+    WIN_MASK   = f"HSV Tuner: {color_name} [{cam_label}] — Mask"
+    WIN_RESULT = f"HSV Tuner: {color_name} [{cam_label}] — Result"
 
     cv2.namedWindow(WIN_CTRL, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WIN_CTRL, 600, 320)
@@ -853,8 +865,10 @@ class ProcessingThread:
             for name, cfg in MARKERS.items():
                 if not cfg.get("enabled"):
                     continue
+                lo2 = cfg["hsv_low_2"]  if cfg.get("hsv_low_2")  is not None else cfg["hsv_low"]
+                hi2 = cfg["hsv_high_2"] if cfg.get("hsv_high_2") is not None else cfg["hsv_high"]
                 pt1 = detect_marker_2d(hsv1, cfg["hsv_low"], cfg["hsv_high"])
-                pt2 = detect_marker_2d(hsv2, cfg["hsv_low"], cfg["hsv_high"])
+                pt2 = detect_marker_2d(hsv2, lo2, hi2)
                 if pt1 and pt2:
                     self._last_good[name] = (pt1, pt2, now)
                 elif pt1 is None or pt2 is None:
@@ -944,6 +958,31 @@ class ProcessingThread:
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _tuner_overlay(img, names, tuner_color):
+    """Draw the HSV tuner selection overlay on a copy of img."""
+    ov = img.copy()
+    if tuner_color is None:
+        cv2.putText(ov, "HSV Tuner — pick colour:",
+                    (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 255), 2)
+        for i, n in enumerate(names):
+            cv2.putText(ov, f"  {i+1}: {n}", (20, 65 + i * 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2)
+        cv2.putText(ov, "  0: Cancel", (20, 65 + len(names) * 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 80, 255), 2)
+    else:
+        has_cam2 = MARKERS[tuner_color].get("hsv_low_2") is not None
+        cv2.putText(ov, f"HSV Tuner: {tuner_color} — pick camera:",
+                    (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 255), 2)
+        cv2.putText(ov, "  1: Camera 1",
+                    (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2)
+        cam2_lbl = f"  2: Camera 2{'  (already calibrated)' if has_cam2 else ''}"
+        cv2.putText(ov, cam2_lbl,
+                    (20, 98), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2)
+        cv2.putText(ov, "  0: Cancel",
+                    (20, 126), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 80, 255), 2)
+    return ov
+
+
 def main():
     # ── Command-line flags ────────────────────────────────────────────────────
     if "--list-cameras" in sys.argv:
@@ -1016,7 +1055,8 @@ def main():
             col_row += ["X", "Y", "Z"]
         w.writerow(col_row)
 
-    tuner_select  = False
+    tuner_select  = False   # True while the color-/camera-selection overlay is shown
+    tuner_color   = None    # set after color chosen, before camera chosen
     last_combined = None
 
     WIN = "Triangulation — cam1 | cam2   (c=calibrate  t=HSV tuner  q=quit)"
@@ -1068,56 +1108,66 @@ def main():
 
             if key == ord("t"):
                 tuner_select = True
+                tuner_color  = None
 
             if tuner_select:
                 names = list(MARKERS.keys())
                 if key == ord("0") or key == 27:
                     tuner_select = False
-                else:
+                    tuner_color  = None
+                elif tuner_color is None:
+                    # Stage 1: pick colour
                     choice = next((i for i, ch in enumerate("123456789")
                                    if key == ord(ch) and i < len(names)), None)
                     if choice is not None:
+                        tuner_color = names[choice]   # advance to stage 2
+                else:
+                    # Stage 2: pick camera
+                    sel = tuner_color
+                    cfg = MARKERS[sel]
+                    cam_key = None
+                    if key == ord("1"):
+                        cam_key = 1
+                    elif key == ord("2"):
+                        cam_key = 2
+                    if cam_key is not None:
                         tuner_select = False
-                        sel = names[choice]
-                        cfg = MARKERS[sel]
-                        capturer.pause(); processor.pause()
-                        res = hsv_tuner(pipe1, K1, D1, sel,
-                                        cfg["hsv_low"].copy(), cfg["hsv_high"].copy())
-                        capturer.resume(); processor.resume()
-                        if res:
-                            cfg["hsv_low"][:], cfg["hsv_high"][:] = res
-                            save_marker_config()
+                        tuner_color  = None
+                        if cam_key == 1:
+                            init_lo = cfg["hsv_low"].copy()
+                            init_hi = cfg["hsv_high"].copy()
+                            capturer.pause(); processor.pause()
+                            res = hsv_tuner(pipe1, K1, D1, sel, init_lo, init_hi,
+                                            cam_label="cam1")
+                            capturer.resume(); processor.resume()
+                            if res:
+                                cfg["hsv_low"][:], cfg["hsv_high"][:] = res
+                                save_marker_config()
+                        else:
+                            lo2 = cfg["hsv_low_2"]  if cfg.get("hsv_low_2")  is not None else cfg["hsv_low"]
+                            hi2 = cfg["hsv_high_2"] if cfg.get("hsv_high_2") is not None else cfg["hsv_high"]
+                            capturer.pause(); processor.pause()
+                            res = hsv_tuner(pipe2, K2, D2, sel, lo2.copy(), hi2.copy(),
+                                            cam_label="cam2")
+                            capturer.resume(); processor.resume()
+                            if res:
+                                cfg["hsv_low_2"], cfg["hsv_high_2"] = res
+                                save_marker_config()
                         continue
 
             # ── Get latest annotated frame from processing thread ─────────────
             result = processor.get_latest()
             if result is None:
                 if tuner_select and last_combined is not None:
-                    ov = last_combined.copy()
-                    names = list(MARKERS.keys())
-                    cv2.putText(ov, "HSV Tuner — press number:",
-                                (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,220,255), 2)
-                    for i, n in enumerate(names):
-                        cv2.putText(ov, f"  {i+1}: {n}", (20, 65+i*28),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,220,255), 2)
-                    cv2.putText(ov, "  0: Cancel", (20, 65+len(names)*28),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,80,255), 2)
-                    cv2.imshow(WIN, ov)
+                    cv2.imshow(WIN, _tuner_overlay(last_combined,
+                                                   list(MARKERS.keys()), tuner_color))
                 continue
 
             last_combined, plot_data = result
 
             if tuner_select:
-                ov = last_combined.copy()
-                names = list(MARKERS.keys())
-                cv2.putText(ov, "HSV Tuner — press number:",
-                            (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,220,255), 2)
-                for i, n in enumerate(names):
-                    cv2.putText(ov, f"  {i+1}: {n}", (20, 65+i*28),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,220,255), 2)
-                cv2.putText(ov, "  0: Cancel", (20, 65+len(names)*28),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,80,255), 2)
-                cv2.imshow(WIN, ov)
+                cv2.imshow(WIN, _tuner_overlay(last_combined,
+                                               list(MARKERS.keys()), tuner_color))
             else:
                 cv2.imshow(WIN, last_combined)
 
