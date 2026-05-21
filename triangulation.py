@@ -799,12 +799,6 @@ class ProcessingThread:
                 self._next_write += slots_due * self._wi
             do_write = slots_due > 0
 
-            if not (do_write or in_warmup):
-                combined = np.hstack([cv2.resize(disp1, (640, 360)),
-                                      cv2.resize(disp2, (640, 360))])
-                self._put(combined, None)
-                continue
-
             # ── Tag detection ─────────────────────────────────────────────
             tags1 = detect_tags_rgb(img1, K1, D1, self._detector, display_img=disp1)
 
@@ -888,7 +882,8 @@ class ProcessingThread:
                 for s in range(slots_due):
                     t_rel    = (bs + s * self._wi) - self._rec_start
                     abs_time = self._rec_start_wall + t_rel
-                    row = [abs_time, t_rel]
+                    ts_str   = datetime.datetime.fromtimestamp(abs_time).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                    row = [ts_str]
                     row += ["0.000000","0.000000","0.000000"] if T_base else ["","",""]
                     for pos in (tag1_world, tag2_world, midpoint_world):
                         row += ([f"{pos[0]:.6f}",f"{pos[1]:.6f}",f"{pos[2]:.6f}"]

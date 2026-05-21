@@ -918,8 +918,9 @@ def main():
         frame_times = deque(maxlen=30)
         write_times = deque(maxlen=30)
         start_time = time.time()
-        next_write_due_s  = None
-        recording_start_s = None
+        next_write_due_s     = None
+        recording_start_s    = None
+        recording_start_wall = None
         write_interval_s  = 1.0 / TARGET_FPS
         last_plot_time = 0.0          # wall-clock time of last 3D plot update
         # Persistence cache for colour markers: name -> (points_list, timestamp)
@@ -928,6 +929,7 @@ def main():
         TAG_PERSISTENCE_S = 0.5     # seconds to hold last known tag world position after dropout
         last_good_tags = {}         # tag_id -> (world_pos_m, wall_time)
         marker_data = []  # Storage for detected markers
+        persistent_circles = {}     # name -> {'pixels': [(px,py)], 'fresh': bool} — drawn every frame
         warmup_end_wall_s = None    # set on first frame; CSV blocked until this time passes
         csv_file = None             # opened once before the loop; closed in finally
 
@@ -981,8 +983,9 @@ def main():
             in_warmup = now_wall_s < warmup_end_wall_s
 
             if next_write_due_s is None and not in_warmup:
-                next_write_due_s = now_wall_s
-                recording_start_s = now_wall_s
+                next_write_due_s   = now_wall_s
+                recording_start_s  = now_wall_s
+                recording_start_wall = time.time()  # wall-clock anchor for absolute timestamps
             slots_due = 0
             if not in_warmup and now_wall_s >= next_write_due_s:
                 slots_due = int((now_wall_s - next_write_due_s) // write_interval_s) + 1
@@ -1023,10 +1026,7 @@ def main():
             # only updates on write frames, so running ArUco on every camera frame (30 fps)
             # wastes ~20-30 ms per frame on work that is immediately discarded.
             frame_times.append(time.time())
-            if not do_write and not in_warmup:
-                if key == ord('q'): break
-                perf_add("loop_total", time.perf_counter() - loop_t0)
-                continue
+            if key == ord('q'): break
 
             # Full detection path — only reached on write/warmup frames.
             t0 = time.perf_counter()
@@ -1068,12 +1068,10 @@ def main():
                 midpoint_coords, tag_positions = detect_other_tags(display_img, intr, T_base, rvec_base, all_corners, all_ids, depth_image, depth_scale)
             perf_add("tag_pose", time.perf_counter() - t0)
 
-            # 2. Detect all enabled coloured markers.
-            # Runs on do_write frames AND during warmup so last_good_color is pre-populated
-            # before the first CSV row is written.
+            # 2. Detect all enabled coloured markers — runs every frame for smooth display.
             all_detections = {}   # name -> list of (xyz, (px,py))
             fresh_detections = {} # name -> True if detected this frame, False if from cache
-            if (do_write or in_warmup) and depth_image is not None:
+            if depth_image is not None:
                 t0 = time.perf_counter()
                 hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
                 hsv_blurred = cv2.GaussianBlur(hsv, (5, 5), 0)
@@ -1168,7 +1166,9 @@ def main():
                 batch_start_s = next_write_due_s - slots_due * write_interval_s
                 for slot_i in range(slots_due):
                     true_time = (batch_start_s + slot_i * write_interval_s) - recording_start_s
-                    csv_row = [frame_count, f"{true_time:.6f}"]
+                    abs_wall  = recording_start_wall + true_time
+                    ts_str    = datetime.datetime.fromtimestamp(abs_wall).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                    csv_row = [frame_count, ts_str]
                     tag0_present = T_base is not None
                     csv_row += ["0.000000", "0.000000", "0.000000"] if tag0_present else ["", "", ""]
                     for pos_m in [tag1_world, tag2_world, midpoint_world]:
@@ -1207,13 +1207,16 @@ def main():
                         continue
                     bgr = MARKERS[name]['bgr']
                     is_fresh = fresh_detections.get(name, False)
+                    pixels = []
                     for _, (px, py) in points:
                         if 0 <= px < display_img.shape[1] and 0 <= py < display_img.shape[0]:
-                            thickness = -1 if is_fresh else 2  # filled=fresh, hollow=cached
+                            thickness = -1 if is_fresh else 2
                             cv2.circle(display_img, (px, py), 8, bgr, thickness)
                             if not is_fresh:
                                 cv2.putText(display_img, "cache", (px + 10, py),
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, bgr, 1)
+                            pixels.append((px, py))
+                    persistent_circles[name] = {'pixels': pixels, 'fresh': is_fresh}
 
             # Calculate and display rates (camera loop vs recording cadence)
             cam_fps = 0.0
@@ -1229,10 +1232,9 @@ def main():
             cv2.putText(display_img, f"REC Hz: {rec_hz:.2f} / {TARGET_FPS:.2f}", (20, h - 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
             
-            if (not SYNC_DRAW_TO_RECORDING) or do_write or in_warmup:
-                t0 = time.perf_counter()
-                cv2.imshow(window_title, display_img)
-                perf_add("display", time.perf_counter() - t0)
+            t0 = time.perf_counter()
+            cv2.imshow(window_title, display_img)
+            perf_add("display", time.perf_counter() - t0)
 
             # Update 3D plot at a limited cadence so Matplotlib does not throttle acquisition.
             plot_tick_due = do_write if SYNC_DRAW_TO_RECORDING else ((time.time() - last_plot_time) >= (1.0 / max(PLOT_UPDATE_HZ, 0.1)))
