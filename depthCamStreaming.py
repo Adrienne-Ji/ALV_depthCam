@@ -1168,7 +1168,7 @@ def main():
                     true_time = (batch_start_s + slot_i * write_interval_s) - recording_start_s
                     abs_wall  = recording_start_wall + true_time
                     ts_str    = datetime.datetime.fromtimestamp(abs_wall).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                    csv_row = [frame_count, ts_str]
+                    csv_row = [frame_count, f"{true_time:.6f}"]
                     tag0_present = T_base is not None
                     csv_row += ["0.000000", "0.000000", "0.000000"] if tag0_present else ["", "", ""]
                     for pos_m in [tag1_world, tag2_world, midpoint_world]:

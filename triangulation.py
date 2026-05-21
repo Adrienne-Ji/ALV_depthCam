@@ -61,7 +61,7 @@ TAG_SIZE_TRACKING = 0.030    # Tags 1 & 2 physical side length (m)
 # ── RECORDING ─────────────────────────────────────────────────────────────────
 TARGET_FPS  = 10             # CSV write rate (Hz)
 WARMUP_S    = 2.0            # seconds of detection before CSV recording starts
-ENABLE_PLOT = True           # Live 3D debug plot (disable for headless / speed)
+ENABLE_PLOT = False           # Live 3D debug plot (disable for headless / speed)
 
 # ── CAMERA STREAM RESOLUTION ──────────────────────────────────────────────────
 # Two cameras simultaneously need ~2× bandwidth.  848×480 is a native D4xx
@@ -883,7 +883,7 @@ class ProcessingThread:
                     t_rel    = (bs + s * self._wi) - self._rec_start
                     abs_time = self._rec_start_wall + t_rel
                     ts_str   = datetime.datetime.fromtimestamp(abs_time).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                    row = [ts_str]
+                    row = [ts_str, f"{t_rel:.6f}"]
                     row += ["0.000000","0.000000","0.000000"] if T_base else ["","",""]
                     for pos in (tag1_world, tag2_world, midpoint_world):
                         row += ([f"{pos[0]:.6f}",f"{pos[1]:.6f}",f"{pos[2]:.6f}"]
