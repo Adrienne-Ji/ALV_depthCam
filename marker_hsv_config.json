@@ -1,54 +1,28 @@
 {
-  "Purple": {
-    "enabled": false,
-    "hsv_low": [
-      97,
-      103,
-      73
-    ],
-    "hsv_high": [
-      124,
-      154,
-      87
-    ]
-  },
   "Pink": {
     "enabled": true,
     "hsv_low": [
-      140,
-      77,
-      145
+      83,
+      180,
+      87
     ],
     "hsv_high": [
-      179,
-      159,
-      236
+      124,
+      255,
+      125
     ]
   },
   "Green": {
     "enabled": true,
     "hsv_low": [
-      17,
-      99,
-      146
+      109,
+      64,
+      24
     ],
     "hsv_high": [
-      41,
-      195,
-      248
-    ]
-  },
-  "Yellow": {
-    "enabled": false,
-    "hsv_low": [
-      24,
-      150,
-      100
-    ],
-    "hsv_high": [
-      32,
-      255,
-      255
+      131,
+      154,
+      96
     ]
   }
 }

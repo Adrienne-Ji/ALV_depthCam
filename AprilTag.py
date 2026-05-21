@@ -7,9 +7,9 @@ from PIL import Image, ImageDraw, ImageFont
 dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
 
 # ===== EASY TO MODIFY =====
-TAG_IDS = [1, 2]           # Which tag IDs to generate for the tracking sheet
+TAG_IDS = [1,2]           # Which tag IDs to generate for the tracking sheet
 TAG_IDS_BASE = [0]         # Base/reference tag — printed separately at full size
-TAG_SIZES_MM = [25, 30]    # Sizes in millimeters for tracking tags
+TAG_SIZES_MM = [30]    # Sizes in millimeters for tracking tags
 BASE_TAG_SIZE_MM = 150     # Size for tag 0 (15 cm × 15 cm)
 PRINT_DPI = 300                   # Print resolution in DPI
 # ==========================

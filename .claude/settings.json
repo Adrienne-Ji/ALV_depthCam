@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python triangulation.py --list-cameras)",
+      "Bash(python3 triangulation.py --list-cameras)"
+    ]
+  }
+}

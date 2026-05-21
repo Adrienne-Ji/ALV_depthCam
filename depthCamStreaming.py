@@ -922,7 +922,6 @@ def main():
         recording_start_s = None
         write_interval_s  = 1.0 / TARGET_FPS
         last_plot_time = 0.0          # wall-clock time of last 3D plot update
-        last_display_circles = {}     # name -> list of (px, py) — drawn every frame for stable display
         # Persistence cache for colour markers: name -> (points_list, timestamp)
         COLOR_PERSISTENCE_S = 1.0   # seconds to hold last known colour position after dropout
         last_good_color = {}        # name -> (points, wall_time)
@@ -1072,11 +1071,12 @@ def main():
             # 2. Detect all enabled coloured markers.
             # Runs on do_write frames AND during warmup so last_good_color is pre-populated
             # before the first CSV row is written.
-            all_detections = {}  # name -> list of 3D points
+            all_detections = {}   # name -> list of (xyz, (px,py))
+            fresh_detections = {} # name -> True if detected this frame, False if from cache
             if (do_write or in_warmup) and depth_image is not None:
                 t0 = time.perf_counter()
                 hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-                hsv_blurred = cv2.GaussianBlur(hsv, (5, 5), 0)  # blurred once, shared across all colours
+                hsv_blurred = cv2.GaussianBlur(hsv, (5, 5), 0)
                 for name, cfg in MARKERS.items():
                     if not cfg.get('enabled', True):
                         continue
@@ -1084,23 +1084,19 @@ def main():
                         hsv_blurred, depth_image, depth_scale, intr,
                         cfg['hsv_low'], cfg['hsv_high'])
                     if fresh:
-                        # Good detection — update cache with camera-frame points AND current transform
-                        # (only store transform if Tag 0 is currently visible)
                         if rmat_inv is not None and tag0_position is not None:
                             last_good_color[name] = (fresh, time.time(), rmat_inv.copy(), tag0_position.copy())
                         else:
                             last_good_color[name] = (fresh, time.time(), None, None)
                         all_detections[name] = fresh
+                        fresh_detections[name] = True
                     else:
-                        # No detection — reuse last known if within persistence window
                         cached = last_good_color.get(name)
                         if cached is not None and (time.time() - cached[1]) <= COLOR_PERSISTENCE_S:
                             all_detections[name] = cached[0]
                         else:
                             all_detections[name] = []
-                    # Update persistent pixel positions for stable every-frame display
-                    if all_detections[name]:
-                        last_display_circles[name] = [(px, py) for _xyz, (px, py) in all_detections[name]]
+                        fresh_detections[name] = False
                 perf_add("color_detect", time.perf_counter() - t0)
 
             # 3. Transform all colored markers relative to Tag 0 world frame
@@ -1201,12 +1197,23 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
                 dbg_y += 24
 
-            # Draw colour marker circles every frame using last known pixel positions
-            for name, pixels in last_display_circles.items():
-                bgr = MARKERS[name]['bgr']
-                for (px, py) in pixels:
-                    if 0 <= px < display_img.shape[1] and 0 <= py < display_img.shape[0]:
-                        cv2.circle(display_img, (px, py), 8, bgr, 2)
+            # Draw colour markers — only when the detection would be written to CSV:
+            #   solid circle  = fresh detection this frame + Tag 0 visible (written to CSV)
+            #   hollow circle = cached detection + Tag 0 visible (written to CSV, but stale)
+            #   nothing       = Tag 0 not visible (CSV writes blank — show nothing)
+            if T_base is not None:
+                for name, points in all_detections.items():
+                    if not points:
+                        continue
+                    bgr = MARKERS[name]['bgr']
+                    is_fresh = fresh_detections.get(name, False)
+                    for _, (px, py) in points:
+                        if 0 <= px < display_img.shape[1] and 0 <= py < display_img.shape[0]:
+                            thickness = -1 if is_fresh else 2  # filled=fresh, hollow=cached
+                            cv2.circle(display_img, (px, py), 8, bgr, thickness)
+                            if not is_fresh:
+                                cv2.putText(display_img, "cache", (px + 10, py),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, bgr, 1)
 
             # Calculate and display rates (camera loop vs recording cadence)
             cam_fps = 0.0
