@@ -22,9 +22,9 @@ TAG_SIZE_TRACKING = 0.03 # Tags 1 & 2 (device) physical size: 3 cm
 # Set CALIB_TAG_SIZE to their physical side length in metres.
 CALIB_TAG_IDS  = [3, 4, 5]   # IDs of the extra calibration-only tags
 CALIB_TAG_SIZE = 0.05         # physical size of the extra calibration tags (metres)
-CSV_NAME = "heart_sim_output.csv"
+CSV_NAME = "calibration_10mm.csv"
 DEPTH_CALIB_FILE  = "depth_calibration.json"
-DEPTH_PRESET_FILE = "mediumDensityCamSettings.json"  # filename in same folder as this script; set to None to skip
+DEPTH_PRESET_FILE = "default.json"  # filename in same folder as this script; set to None to skip
 DEPTH_SCALE_M  = 1.0      # Multiplicative depth correction: corrected = raw * DEPTH_SCALE_M + DEPTH_OFFSET_M
 DEPTH_OFFSET_M = 0.0      # Additive depth correction (metres)
 TARGET_FPS = 10            # Consistent output frame rate written to CSV (frames/sec)
@@ -898,7 +898,7 @@ def main():
             sub_row += ["Position", "Position", "Position"]
         w.writerow(sub_row)
         # Row 7: column labels
-        col_row = ["Frame", "Time (Seconds)"]
+        col_row = ["Timestamp", "Time (Seconds)"]
         for _ in rigid_cols + enabled_markers:
             col_row += ["X", "Y", "Z"]
         w.writerow(col_row)
@@ -1172,7 +1172,7 @@ def main():
                     true_time = (batch_start_s + slot_i * write_interval_s) - recording_start_s
                     abs_wall  = recording_start_wall + true_time
                     ts_str    = datetime.datetime.fromtimestamp(abs_wall).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                    csv_row = [frame_count, f"{true_time:.6f}"]
+                    csv_row = [ts_str, f"{true_time:.6f}"]
                     tag0_present = T_base is not None
                     csv_row += ["0.000000", "0.000000", "0.000000"] if tag0_present else ["", "", ""]
                     for pos_m in [tag1_world, tag2_world, midpoint_world]:
