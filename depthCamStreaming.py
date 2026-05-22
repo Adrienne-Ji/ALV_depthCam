@@ -781,6 +781,8 @@ def main():
                         help="Path to a RealSense JSON preset file (e.g. HighAccuracyPreset.json).")
     parser.add_argument("--recalibrate", action="store_true",
                         help="Force a fresh depth calibration even if a saved one exists.")
+    parser.add_argument("--no-calib", action="store_true",
+                        help="Skip depth calibration entirely (use raw depth, scale=1.0, offset=0.0).")
     args = parser.parse_args()
 
     global MARKER_CONFIG_FILE
@@ -843,7 +845,9 @@ def main():
     )
 
     # Depth calibration — run once before data collection starts
-    if args.recalibrate or not os.path.exists(DEPTH_CALIB_FILE):
+    if getattr(args, 'no_calib', False):
+        print("[Depth Calib] Skipped (--no-calib) — using raw depth, scale=1.0, offset=0.0.")
+    elif args.recalibrate or not os.path.exists(DEPTH_CALIB_FILE):
         print("[Depth Calib] Running calibration — move Tags 1 & 2 through the full depth range.")
         run_depth_calibration(pipeline, align, intr, depth_scale, detector)
     else:
