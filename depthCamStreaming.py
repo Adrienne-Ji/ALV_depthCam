@@ -22,7 +22,7 @@ TAG_SIZE_TRACKING = 0.05 # Tags 1 & 2 (device) physical size: 5 cm
 # Set CALIB_TAG_SIZE to their physical side length in metres.
 CALIB_TAG_IDS  = [3, 4, 5]   # IDs of the extra calibration-only tags
 CALIB_TAG_SIZE = 0.05         # physical size of the extra calibration tags (metres)
-CSV_NAME = "calibration_10mm.csv"
+CSV_NAME = "MDC_data.csv"     # medium densiy calibrated data output 
 DEPTH_CALIB_FILE  = "depth_calibration.json"
 DEPTH_PRESET_FILE = "mediumDensityCamSettings.json"  # filename in same folder as this script; set to None to skip
 DEPTH_SCALE_M  = 1.0      # Multiplicative depth correction: corrected = raw * DEPTH_SCALE_M + DEPTH_OFFSET_M
@@ -852,13 +852,16 @@ def main():
         print("[Depth Calib] Running calibration — move Tags 1 & 2 through the full depth range.")
         run_depth_calibration(pipeline, align, intr, depth_scale, detector)
 
-    # Initialize CSV with mocap-compatible 6-row header
+    # CSV header is written lazily once recording_start_wall is known (after warmup).
+    # This ensures Capture Start Time == recording_start_wall exactly, so
+    # start_dt + Time_s = true wall-clock time for every frame with no offset needed.
     enabled_markers = [name for name, cfg in MARKERS.items() if cfg.get('enabled', True)]
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
-    with open(csv_output_path, 'w', newline='') as f:
-        w = csv.writer(f)
-        # Row 1: file metadata
-        w.writerow([
+    csv_header_written = False
+
+    def write_csv_header(writer, start_wall_s):
+        now_str = datetime.datetime.fromtimestamp(start_wall_s).strftime("%Y-%m-%d %I:%M:%S %p")
+        rigid_cols = ["Tag0", "Tag1", "Tag2", "Midpoint"]
+        writer.writerow([
             "Format Version", "1.23",
             "Take Name", os.path.splitext(os.path.basename(csv_output_path))[0],
             "Take Notes", "",
@@ -871,36 +874,29 @@ def main():
             "Length Units", "Meters",
             "Coordinate Space", "Global",
         ])
-        # Row 2: blank
-        w.writerow([])
-        # Row 3: Type  — Tag0, Tag1, Tag2, Midpoint first, then colour markers
-        rigid_cols = ["Tag0", "Tag1", "Tag2", "Midpoint"]
-        w.writerow(["", "Type"] + ["Rigid Body Marker", "Rigid Body Marker", "Rigid Body Marker"] * len(rigid_cols)
-                                 + ["Marker", "Marker", "Marker"] * len(enabled_markers))
-        # Row 4: Name
+        writer.writerow([])
+        writer.writerow(["", "Type"] + ["Rigid Body Marker", "Rigid Body Marker", "Rigid Body Marker"] * len(rigid_cols)
+                                      + ["Marker", "Marker", "Marker"] * len(enabled_markers))
         name_row = ["", "Name"]
         for n in rigid_cols:
             name_row += [n, n, n]
         for n in enabled_markers:
             name_row += [n, n, n]
-        w.writerow(name_row)
-        # Row 5: ID
+        writer.writerow(name_row)
         id_row = ["", "ID"]
         for n in rigid_cols:
             id_row += [n, n, n]
         for n in enabled_markers:
             id_row += [n, n, n]
-        w.writerow(id_row)
-        # Row 6: sub-type
+        writer.writerow(id_row)
         sub_row = ["", ""]
         for _ in rigid_cols + enabled_markers:
             sub_row += ["Position", "Position", "Position"]
-        w.writerow(sub_row)
-        # Row 7: column labels
+        writer.writerow(sub_row)
         col_row = ["Timestamp", "Time (Seconds)"]
         for _ in rigid_cols + enabled_markers:
             col_row += ["X", "Y", "Z"]
-        w.writerow(col_row)
+        writer.writerow(col_row)
 
     # Data buffer for plotting
     # coord_buffer = deque(maxlen=300)  # No longer needed - tracking individual markers now
@@ -995,6 +991,9 @@ def main():
             if next_write_due_s is None and not in_warmup:
                 next_write_due_s     = now_wall_s
                 recording_start_wall = now_wall_s   # wall-clock anchor; same clock as MATLAB
+                if not csv_header_written:
+                    write_csv_header(csv_writer_obj, recording_start_wall)
+                    csv_header_written = True
             slots_due = 0
             if not in_warmup and now_wall_s >= next_write_due_s:
                 slots_due = int((now_wall_s - next_write_due_s) // write_interval_s) + 1
@@ -1186,8 +1185,8 @@ def main():
                 # Time of the first slot in this batch, then spaced by write_interval_s
                 batch_start_s = next_write_due_s - slots_due * write_interval_s
                 for slot_i in range(slots_due):
-                    true_time = (batch_start_s + slot_i * write_interval_s) - recording_start_wall
-                    abs_wall  = recording_start_wall + true_time
+                    abs_wall  = batch_start_s + slot_i * write_interval_s
+                    true_time = abs_wall - recording_start_wall
                     ts_str    = datetime.datetime.fromtimestamp(abs_wall).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                     csv_row = [ts_str, f"{true_time:.6f}"]
                     tag0_present = T_base is not None
