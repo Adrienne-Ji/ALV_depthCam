@@ -1,0 +1,99 @@
+clearvars; 
+clc;
+import zaber.motion.ascii.Connection;
+import zaber.motion.Units;
+
+% --- Configuration ---
+csvPath = "C:\Users\z5448472\Desktop\ALV_matlab\20mpts_10mlApexUp.csv";
+absolute_min = 200;
+absolute_max = 248;
+base_name = 'movement_log20pts_10ml_10mm_triangulation_masked';
+
+
+% --- Connection setup ---
+connection = Connection.openSerialPort('COM4');
+
+% Use onCleanup to ensure port closes even if script errors or is interrupted
+cleanupObj = onCleanup(@() connection.close());
+
+% --- Load the waveform data ---
+data = readtable(csvPath);
+time_points = data.("Time_s_");
+pos_U1 = data.("PositionU1_mm_");
+pos_U2 = data.("PositionU2_mm_");
+pos_U3 = data.("PositionU3_mm_");
+
+% --- Log file setup ---
+log_file = [base_name '.csv'];
+if exist(log_file, 'file')
+    serial = 1;
+    while exist(sprintf('%s_%d.csv', base_name, serial), 'file')
+        serial = serial + 1;
+    end
+    log_file = sprintf('%s_%d.csv', base_name, serial);
+    fprintf('Log file already exists. Saving as: %s\n', log_file);
+end
+
+fid = fopen(log_file, 'w');
+fprintf(fid, 'Time Stamp,Elapsed Time (s),Position_U1 (mm),Position_U2 (mm),Position_U3 (mm)\n');
+fclose(fid); 
+fid = fopen(log_file, 'a');
+
+% --- Initialize Devices ---
+try
+    connection.enableAlerts();
+    deviceList = connection.detectDevices();
+    
+    % FIX: Use MATLAB length() instead of .length property
+    fprintf('Found %d devices.\n', length(deviceList));
+    
+    device1 = deviceList(1);
+    axis1 = device1.getAxis(1);
+    axis2 = device1.getAxis(2);
+    axis3 = device1.getAxis(3);
+
+    axis1.Settings.set('maxspeed', 10, Units.VelocityMillimetresPerSecond);
+    axis2.Settings.set('maxspeed', 10, Units.VelocityMillimetresPerSecond);
+    axis3.Settings.set('maxspeed', 10, Units.VelocityMillimetresPerSecond);
+
+
+    % --- Main movement loop ---
+    num_rows = height(data);
+    overall_start = tic;
+
+    for i = 1:num_rows
+        % Clamp positions
+        pos1 = min(max(pos_U1(i), absolute_min), absolute_max);
+        pos2 = min(max(pos_U2(i), absolute_min), absolute_max);
+        pos3 = min(max(pos_U3(i), absolute_min), absolute_max);
+
+        % Log data
+        now_time = datestr(datetime, 'yyyy-mm-dd HH:MM:ss.FFF');
+        elapsed_time = toc(overall_start);
+        fprintf(fid, '%s,%.6f,%.3f,%.3f,%.3f\n', now_time, elapsed_time, pos1, pos2, pos3);
+        
+        axis1.moveAbsolute(pos1, Units.LengthMillimetres, 'wait', false);
+        axis2.moveAbsolute(pos2, Units.LengthMillimetres, 'wait', false);
+        axis3.moveAbsolute(pos3, Units.LengthMillimetres, 'wait', false);
+
+
+        % Pausing logic
+        if i == 1
+            pause(3);
+        else
+            pause(3);
+        end
+
+        if mod(i, 10) == 0 % Print progress every 10 steps to keep console clean
+            fprintf('Progress: %.2f%%\n', (i / num_rows) * 100);
+        end
+    end
+
+catch exception
+    fclose(fid);
+    rethrow(exception);
+end
+
+fclose(fid);
+% connection.close() is handled by cleanupObj automatically
+fprintf('Movement completed. Log saved to: %s\n', log_file);
