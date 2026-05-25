@@ -35,7 +35,8 @@ ENABLE_PERF_LOG = False   # Print per-stage timing so bottlenecks are visible in
 PERF_LOG_INTERVAL_S = 2.0 # Seconds between profiler summaries
 ARUCO_DETECT_SCALE = 0.5  # Run tag detection on downscaled frame (single-cam); set to 1.0 in dual-cam mode automatically
 FAST_ARUCO_MODE = True    # Relax expensive ArUco options to recover real-time performance
-WARMUP_S = 2.0            # Seconds of pre-detection before CSV recording starts (pre-warms colour cache)
+WARMUP_S = 10.0           # Seconds of pre-detection before CSV recording starts (pre-warms colour cache
+                          # and accumulates Tag0 pose samples for the warmup lock)
 USE_TAG0_YZ_TO_XY_REMAP = False  # True when Tag 0 is physically mounted on the YZ plane
 CIRCULARITY_MIN = 0.45    # Minimum circularity (4π·area/perimeter²) to accept a blob as a round marker
 MARKER_AREA_MIN = 20      # Minimum contour area in pixels to consider
@@ -923,7 +924,6 @@ def main():
         write_times = deque(maxlen=30)
         start_time = time.time()
         next_write_due_s     = None
-        recording_start_s    = None
         recording_start_wall = None
         write_interval_s  = 1.0 / TARGET_FPS
         last_plot_time = 0.0          # wall-clock time of last 3D plot update
@@ -932,6 +932,14 @@ def main():
         last_good_color = {}        # name -> (points, wall_time)
         TAG_PERSISTENCE_S = 0.5     # seconds to hold last known tag world position after dropout
         last_good_tags = {}         # tag_id -> (world_pos_m, wall_time)
+        # Tag0 is stationary for the entire recording, so we accumulate PnP estimates
+        # during warmup and lock in a single fixed pose at recording start.
+        # This eliminates frame-to-frame rmat_inv jitter that causes all markers to
+        # spike simultaneously (every position is rotated by the same matrix).
+        rvec_base_accum  = []   # warmup accumulator for rotation vectors
+        tag0_pos_accum   = []   # warmup accumulator for translation vectors
+        rvec_base_fixed  = None # locked after warmup
+        tag0_pos_fixed   = None # locked after warmup
         marker_data = []  # Storage for detected markers
         persistent_circles = {}     # name -> {'pixels': [(px,py)], 'fresh': bool} — drawn every frame
         warmup_end_wall_s = None    # set on first frame; CSV blocked until this time passes
@@ -981,15 +989,14 @@ def main():
             # Warmup: run detection for WARMUP_S seconds before starting CSV recording.
             # This pre-warms last_good_color so frame 0 has full marker data.
             # (The old depth-patch check fired on frame 1, making warmup effectively 0 frames.)
-            now_wall_s = time.perf_counter()
+            now_wall_s = time.time()
             if warmup_end_wall_s is None:
                 warmup_end_wall_s = now_wall_s + WARMUP_S
             in_warmup = now_wall_s < warmup_end_wall_s
 
             if next_write_due_s is None and not in_warmup:
-                next_write_due_s   = now_wall_s
-                recording_start_s  = now_wall_s
-                recording_start_wall = time.time()  # wall-clock anchor for absolute timestamps
+                next_write_due_s     = now_wall_s
+                recording_start_wall = now_wall_s   # wall-clock anchor; same clock as MATLAB
             slots_due = 0
             if not in_warmup and now_wall_s >= next_write_due_s:
                 slots_due = int((now_wall_s - next_write_due_s) // write_interval_s) + 1
@@ -1064,6 +1071,16 @@ def main():
             rvec_base = None
             if result is not None:
                 T_base, rvec_base = result
+                if in_warmup:
+                    # Accumulate during warmup; Tag0 is stationary so we average all
+                    # warmup estimates and lock them in once recording begins.
+                    rvec_base_accum.append(rvec_base.flatten())
+                    tag0_pos_accum.append(T_base[:3, 3].copy())
+                elif rvec_base_fixed is None and rvec_base_accum:
+                    # Warmup just ended — lock in the mean pose for the whole recording.
+                    rvec_base_fixed = np.mean(np.stack(rvec_base_accum), axis=0)
+                    tag0_pos_fixed  = np.mean(np.stack(tag0_pos_accum),  axis=0)
+                    print(f"[Tag0] Pose locked from {len(rvec_base_accum)} warmup frames.")
 
             # 1b. Detect Tags 1 & 2
             midpoint_coords = None
@@ -1108,9 +1125,11 @@ def main():
             midpoint_world = None
             
             if T_base is not None:
-                # Tag 0 is visible — always transform relative to it
-                tag0_position = T_base[:3, 3]          # (3,) camera-frame position of tag 0
-                rmat_world, _ = cv2.Rodrigues(rvec_base.flatten())  # ensure (3,) input
+                # Use the warmup-locked pose if available; fall back to the live estimate
+                # only before warmup has accumulated any frames (e.g. first few frames).
+                rvec_use      = rvec_base_fixed if rvec_base_fixed is not None else rvec_base.flatten()
+                tag0_position = tag0_pos_fixed  if tag0_pos_fixed  is not None else T_base[:3, 3]
+                rmat_world, _ = cv2.Rodrigues(rvec_use)
                 if USE_TAG0_YZ_TO_XY_REMAP:
                     rmat_world = rmat_world @ R_YZ_TO_XY
                 # Apply camera frame axis permutation (map ZX plane to XY)
@@ -1169,7 +1188,7 @@ def main():
                 # Time of the first slot in this batch, then spaced by write_interval_s
                 batch_start_s = next_write_due_s - slots_due * write_interval_s
                 for slot_i in range(slots_due):
-                    true_time = (batch_start_s + slot_i * write_interval_s) - recording_start_s
+                    true_time = (batch_start_s + slot_i * write_interval_s) - recording_start_wall
                     abs_wall  = recording_start_wall + true_time
                     ts_str    = datetime.datetime.fromtimestamp(abs_wall).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                     csv_row = [ts_str, f"{true_time:.6f}"]
