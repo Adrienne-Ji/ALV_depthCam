@@ -17,14 +17,14 @@ from collections import deque
 
 # --- SETTINGS ---
 TAG_SIZE = 0.150          # Tag 0 (reference base) physical size: 15 cm
-TAG_SIZE_TRACKING = 0.03 # Tags 1 & 2 (device) physical size: 3 cm
+TAG_SIZE_TRACKING = 0.05 # Tags 1 & 2 (device) physical size: 5 cm
 # Extra tags used only during depth calibration — add as many as you like.
 # Set CALIB_TAG_SIZE to their physical side length in metres.
 CALIB_TAG_IDS  = [3, 4, 5]   # IDs of the extra calibration-only tags
 CALIB_TAG_SIZE = 0.05         # physical size of the extra calibration tags (metres)
 CSV_NAME = "calibration_10mm.csv"
 DEPTH_CALIB_FILE  = "depth_calibration.json"
-DEPTH_PRESET_FILE = "default.json"  # filename in same folder as this script; set to None to skip
+DEPTH_PRESET_FILE = "mediumDensityCamSettings.json"  # filename in same folder as this script; set to None to skip
 DEPTH_SCALE_M  = 1.0      # Multiplicative depth correction: corrected = raw * DEPTH_SCALE_M + DEPTH_OFFSET_M
 DEPTH_OFFSET_M = 0.0      # Additive depth correction (metres)
 TARGET_FPS = 10            # Consistent output frame rate written to CSV (frames/sec)
@@ -845,14 +845,12 @@ def main():
         aruco_params
     )
 
-    # Depth calibration — run once before data collection starts
+    # Depth calibration — always run on startup; skip only with --no-calib
     if getattr(args, 'no_calib', False):
         print("[Depth Calib] Skipped (--no-calib) — using raw depth, scale=1.0, offset=0.0.")
-    elif args.recalibrate or not os.path.exists(DEPTH_CALIB_FILE):
+    else:
         print("[Depth Calib] Running calibration — move Tags 1 & 2 through the full depth range.")
         run_depth_calibration(pipeline, align, intr, depth_scale, detector)
-    else:
-        print(f"[Depth Calib] Using saved calibration from {DEPTH_CALIB_FILE}. Pass --recalibrate to redo.")
 
     # Initialize CSV with mocap-compatible 6-row header
     enabled_markers = [name for name, cfg in MARKERS.items() if cfg.get('enabled', True)]
