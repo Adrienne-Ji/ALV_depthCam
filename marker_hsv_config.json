@@ -1,15 +1,15 @@
 {
   "Purple": {
-    "enabled": false,
+    "enabled": true,
     "hsv_low": [
-      137,
-      54,
-      131
+      117,
+      85,
+      41
     ],
     "hsv_high": [
-      179,
-      185,
-      203
+      146,
+      123,
+      86
     ]
   },
   "Pink": {

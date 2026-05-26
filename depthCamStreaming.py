@@ -65,7 +65,7 @@ R_CAMERA_FLIP = np.array([
 # Set 'enabled': True/False here to choose which colours are tracked.
 # HSV thresholds can also be tuned interactively at runtime with the 't' key.
 MARKERS = {
-    'Purple': { 'enabled': False,
+    'Purple': { 'enabled': True,
                 'hsv_low':  np.array([120, 120,  80]),   # H 128-152, S≥130, V 80-200
                 'hsv_high': np.array([165, 155, 175]),
                 'bgr': (128, 0, 128) },
