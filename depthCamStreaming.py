@@ -17,7 +17,7 @@ from collections import deque
 
 # --- SETTINGS ---
 TAG_SIZE = 0.150          # Tag 0 (reference base) physical size: 15 cm
-TAG_SIZE_TRACKING = 0.05 # Tags 1 & 2 (device) physical size: 5 cm
+TAG_SIZE_TRACKING = 0.065 # Tags 1 & 2 (device) physical size: 6.5 cm
 # Extra tags used only during depth calibration — add as many as you like.
 # Set CALIB_TAG_SIZE to their physical side length in metres.
 CALIB_TAG_IDS  = [3, 4, 5]   # IDs of the extra calibration-only tags
