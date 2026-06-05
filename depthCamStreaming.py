@@ -141,7 +141,7 @@ def save_depth_calibration():
     print(f"[Depth Calib] Saved — scale: {DEPTH_SCALE_M:.6f}  offset: {DEPTH_OFFSET_M*100:+.2f} cm → {DEPTH_CALIB_FILE}")
 
 
-def run_depth_calibration(pipeline, align, intr, depth_scale, detector, n_samples=2000):
+def run_depth_calibration(pipeline, align, intr, depth_scale, detector, n_samples=500):
     """
     Fit a linear depth correction (corrected = raw * scale + offset) using all
     three AprilTags (0, 1, 2) as simultaneous PnP ground-truth references.
