@@ -52,6 +52,6 @@ except KeyboardInterrupt:
         with open(filename, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([f"start_time_iso={start_time_iso}"])
-            writer.writerow(["time_sec", "Endo_mm", "Trans_mm", "Epi_mm"])
+            writer.writerow(["time_sec", "Epi_mm", "Trans_mm", "Endo_mm"])
             writer.writerows(data_log)
         print(f"Success! {len(data_log)} samples saved to {filename}")
