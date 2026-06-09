@@ -35,8 +35,7 @@ ENABLE_PERF_LOG = False   # Print per-stage timing so bottlenecks are visible in
 PERF_LOG_INTERVAL_S = 2.0 # Seconds between profiler summaries
 ARUCO_DETECT_SCALE = 0.5  # Run tag detection on downscaled frame (single-cam); set to 1.0 in dual-cam mode automatically
 FAST_ARUCO_MODE = True    # Relax expensive ArUco options to recover real-time performance
-WARMUP_S = 10.0           # Seconds of pre-detection before CSV recording starts (pre-warms colour cache
-                          # and accumulates Tag0 pose samples for the warmup lock)
+WARMUP_S = 3.0            # Delay CSV recording start (hardware warmup); Tag0 pose is live every frame
 USE_TAG0_YZ_TO_XY_REMAP = False  # True when Tag 0 is physically mounted on the YZ plane
 CIRCULARITY_MIN = 0.45    # Minimum circularity (4π·area/perimeter²) to accept a blob as a round marker
 MARKER_AREA_MIN = 20      # Minimum contour area in pixels to consider
@@ -926,14 +925,6 @@ def main():
         last_good_color = {}        # name -> (points, wall_time)
         TAG_PERSISTENCE_S = 0.5     # seconds to hold last known tag world position after dropout
         last_good_tags = {}         # tag_id -> (world_pos_m, wall_time)
-        # Tag0 is stationary for the entire recording, so we accumulate PnP estimates
-        # during warmup and lock in a single fixed pose at recording start.
-        # This eliminates frame-to-frame rmat_inv jitter that causes all markers to
-        # spike simultaneously (every position is rotated by the same matrix).
-        rvec_base_accum  = []   # warmup accumulator for rotation vectors
-        tag0_pos_accum   = []   # warmup accumulator for translation vectors
-        rvec_base_fixed  = None # locked after warmup
-        tag0_pos_fixed   = None # locked after warmup
         marker_data = []  # Storage for detected markers
         persistent_circles = {}     # name -> {'pixels': [(px,py)], 'fresh': bool} — drawn every frame
         warmup_end_wall_s = None    # set on first frame; CSV blocked until this time passes
@@ -1068,16 +1059,6 @@ def main():
             rvec_base = None
             if result is not None:
                 T_base, rvec_base = result
-                if in_warmup:
-                    # Accumulate during warmup; Tag0 is stationary so we average all
-                    # warmup estimates and lock them in once recording begins.
-                    rvec_base_accum.append(rvec_base.flatten())
-                    tag0_pos_accum.append(T_base[:3, 3].copy())
-                elif rvec_base_fixed is None and rvec_base_accum:
-                    # Warmup just ended — lock in the mean pose for the whole recording.
-                    rvec_base_fixed = np.mean(np.stack(rvec_base_accum), axis=0)
-                    tag0_pos_fixed  = np.mean(np.stack(tag0_pos_accum),  axis=0)
-                    print(f"[Tag0] Pose locked from {len(rvec_base_accum)} warmup frames.")
 
             # 1b. Detect Tags 1 & 2
             midpoint_coords = None
@@ -1122,10 +1103,8 @@ def main():
             midpoint_world = None
             
             if T_base is not None:
-                # Use the warmup-locked pose if available; fall back to the live estimate
-                # only before warmup has accumulated any frames (e.g. first few frames).
-                rvec_use      = rvec_base_fixed if rvec_base_fixed is not None else rvec_base.flatten()
-                tag0_position = tag0_pos_fixed  if tag0_pos_fixed  is not None else T_base[:3, 3]
+                rvec_use      = rvec_base.flatten()
+                tag0_position = T_base[:3, 3]
                 rmat_world, _ = cv2.Rodrigues(rvec_use)
                 if USE_TAG0_YZ_TO_XY_REMAP:
                     rmat_world = rmat_world @ R_YZ_TO_XY
