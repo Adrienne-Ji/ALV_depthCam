@@ -929,6 +929,7 @@ def main():
         persistent_circles = {}     # name -> {'pixels': [(px,py)], 'fresh': bool} — drawn every frame
         warmup_end_wall_s = None    # set on first frame; CSV blocked until this time passes
         csv_file = None             # opened once before the loop; closed in finally
+        tuner_select = False
 
         perf_stats = {}
         perf_last_report = time.perf_counter()
@@ -991,41 +992,11 @@ def main():
                 next_write_due_s += slots_due * write_interval_s
             do_write = slots_due > 0
 
-            key = cv2.waitKey(1) & 0xFF
-
-            # Keypress: c = recalibrate depth, t = HSV tuner, q = quit
-            if key == ord('c'):
-                run_depth_calibration(pipeline, align, intr, depth_scale, detector)
-                continue
-
-            if key == ord('t'):
-                color_keys = list(MARKERS.keys())
-                print("\n[HSV Tuner] Select colour to tune:")
-                for idx, name in enumerate(color_keys):
-                    print(f"  {idx+1}. {name}")
-                print("  Enter number (or 0 to cancel): ", end='', flush=True)
-                try:
-                    choice = int(input())
-                except ValueError:
-                    choice = 0
-                if 1 <= choice <= len(color_keys):
-                    selected = color_keys[choice - 1]
-                    cfg = MARKERS[selected]
-                    result = hsv_tuner(pipeline, align, intr, depth_scale,
-                                       initial_low=cfg['hsv_low'].copy(),
-                                       initial_high=cfg['hsv_high'].copy(),
-                                       color_name=selected)
-                    if result is not None:
-                        cfg['hsv_low'][:], cfg['hsv_high'][:] = result
-                        save_marker_config()
-                continue
-
             # Track every camera frame for the FPS display, then fast-exit if there is
             # nothing to record or display.  With SYNC_DRAW_TO_RECORDING=True the display
             # only updates on write frames, so running ArUco on every camera frame (30 fps)
             # wastes ~20-30 ms per frame on work that is immediately discarded.
             frame_times.append(time.time())
-            if key == ord('q'): break
 
             # Full detection path — only reached on write/warmup frames.
             t0 = time.perf_counter()
@@ -1231,9 +1202,45 @@ def main():
             cv2.putText(display_img, f"REC Hz: {rec_hz:.2f} / {TARGET_FPS:.2f}", (20, h - 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
             
+            if tuner_select:
+                _ckeys = list(MARKERS.keys())
+                oy = display_img.shape[0] // 2 - 40
+                cv2.putText(display_img, "HSV Tuner — pick colour (0=cancel):",
+                            (30, oy), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                for _i, _n in enumerate(_ckeys):
+                    cv2.putText(display_img, f"  {_i+1}: {_n}",
+                                (30, oy + 30 + _i * 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 1)
+
             t0 = time.perf_counter()
             cv2.imshow(window_title, display_img)
             perf_add("display", time.perf_counter() - t0)
+
+            key = cv2.waitKey(1) & 0xFF
+            if tuner_select:
+                _ckeys = list(MARKERS.keys())
+                if key == ord('0') or key == 27:
+                    tuner_select = False
+                else:
+                    _choice = next((i for i, ch in enumerate("123456789")
+                                    if key == ord(ch) and i < len(_ckeys)), None)
+                    if _choice is not None:
+                        tuner_select = False
+                        _sel = _ckeys[_choice]
+                        _cfg = MARKERS[_sel]
+                        _res = hsv_tuner(pipeline, align, intr, depth_scale,
+                                         initial_low=_cfg['hsv_low'].copy(),
+                                         initial_high=_cfg['hsv_high'].copy(),
+                                         color_name=_sel)
+                        if _res is not None:
+                            _cfg['hsv_low'][:], _cfg['hsv_high'][:] = _res
+                            save_marker_config()
+            else:
+                if key in (ord('q'), 27):
+                    break
+                elif key == ord('c'):
+                    run_depth_calibration(pipeline, align, intr, depth_scale, detector)
+                elif key == ord('t'):
+                    tuner_select = True
 
             # Update 3D plot at a limited cadence so Matplotlib does not throttle acquisition.
             plot_tick_due = do_write if SYNC_DRAW_TO_RECORDING else ((time.time() - last_plot_time) >= (1.0 / max(PLOT_UPDATE_HZ, 0.1)))
@@ -1288,8 +1295,6 @@ def main():
 
             perf_add("loop_total", time.perf_counter() - loop_t0)
             perf_report_if_due()
-
-            if key == ord('q'): break
 
     finally:
         pipeline.stop()
