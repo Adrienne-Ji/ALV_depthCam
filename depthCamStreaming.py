@@ -966,7 +966,18 @@ def main():
             loop_t0 = time.perf_counter()
 
             t0 = time.perf_counter()
-            frames = pipeline.wait_for_frames()
+            # Drain stale frames from the librealsense queue so we always process
+            # the newest frameset. poll_for_frames() is non-blocking; fall back to
+            # wait_for_frames() only when the queue was already empty.
+            frames = None
+            while True:
+                f = pipeline.poll_for_frames()
+                if f and f.size() > 0:
+                    frames = f
+                else:
+                    break
+            if frames is None:
+                frames = pipeline.wait_for_frames()
             color_frame = frames.get_color_frame()
             depth_frame = frames.get_depth_frame()
             perf_add("wait_for_frames", time.perf_counter() - t0)
